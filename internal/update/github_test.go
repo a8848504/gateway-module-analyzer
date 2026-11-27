@@ -14,8 +14,8 @@ func TestUpdateDownloadAndVersionCheck(t *testing.T) {
 	raw := []byte("test release asset")
 	digest := fmt.Sprintf("%x", sha256.Sum256(raw))
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer test-read-token" {
-			w.WriteHeader(http.StatusUnauthorized)
+		if r.Header.Get("Authorization") != "" {
+			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
 		switch r.URL.Path {
@@ -32,7 +32,7 @@ func TestUpdateDownloadAndVersionCheck(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	api := NewGitHub("demo/analyzer", "test-read-token")
+	api := NewGitHub("demo/analyzer")
 	api.base = server.URL
 	ctx := context.Background()
 	current, err := api.Latest(ctx, "v1.10.1", "amd64")

@@ -29,13 +29,13 @@ type Release struct {
 }
 
 type GitHub struct {
-	repo, token string
-	base        string
-	client      *http.Client
+	repo   string
+	base   string
+	client *http.Client
 }
 
-func NewGitHub(repo, token string) *GitHub {
-	return &GitHub{repo: repo, token: strings.TrimSpace(token), base: "https://api.github.com",
+func NewGitHub(repo string) *GitHub {
+	return &GitHub{repo: repo, base: "https://api.github.com",
 		client: &http.Client{
 			Timeout: 2 * time.Minute,
 			CheckRedirect: func(request *http.Request, via []*http.Request) error {
@@ -44,9 +44,6 @@ func NewGitHub(repo, token string) *GitHub {
 					(host != "api.github.com" && host != "github.com" &&
 						host != "objects.githubusercontent.com" && host != "release-assets.githubusercontent.com") {
 					return errors.New("GitHub 更新下载重定向地址无效")
-				}
-				if host != "api.github.com" {
-					request.Header.Del("Authorization")
 				}
 				return nil
 			},
@@ -90,16 +87,16 @@ func (g *GitHub) request(ctx context.Context, endpoint, accept string) (*http.Re
 	req.Header.Set("Accept", accept)
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 	req.Header.Set("User-Agent", "GatewayModuleAnalyzer")
-	if g.token != "" {
-		req.Header.Set("Authorization", "Bearer "+g.token)
-	}
 	res, err := g.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("访问 GitHub 失败: %w", err)
 	}
 	if res.StatusCode != http.StatusOK {
 		res.Body.Close()
-		return nil, fmt.Errorf("GitHub 返回 HTTP %d，请检查仓库访问权限、令牌和网络", res.StatusCode)
+		if res.StatusCode == http.StatusTooManyRequests || (res.StatusCode == http.StatusForbidden && res.Header.Get("X-RateLimit-Remaining") == "0") {
+			return nil, errors.New("GitHub 更新检查达到请求上限，请稍后重试")
+		}
+		return nil, fmt.Errorf("GitHub 返回 HTTP %d，请检查网络和公开发行版是否可访问", res.StatusCode)
 	}
 	return res, nil
 }

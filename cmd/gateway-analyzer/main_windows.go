@@ -30,14 +30,12 @@ var (
 const (
 	startID   = 101
 	stopID    = 102
-	gatewayID = 103
 	updateID  = 104
 	wmWork    = 0x8001
 	wmCommand = 0x0111
 	wmClose   = 0x0010
 	wmDestroy = 0x0002
 	cbAdd     = 0x0143
-	cbReset   = 0x014b
 	cbGet     = 0x0147
 	cbSet     = 0x014e
 )
@@ -61,17 +59,15 @@ type message struct {
 }
 
 type application struct {
-	window, instance, font                     uintptr
-	port, duration, mode, gateway, token       uintptr
-	startButton, stopButton, updateButton      uintptr
-	status, first, second, detail, diagnostics uintptr
-	scale                                      int
-	busy, closing, stopping                    bool
-	stop                                       chan struct{}
-	sample                                     *capture.Sample
-	gatewayIDs                                 []string
-	mu                                         sync.Mutex
-	work                                       []func()
+	window, instance, font                uintptr
+	port, duration, mode, list, status    uintptr
+	startButton, stopButton, updateButton uintptr
+	scale                                 int
+	busy, closing, stopping               bool
+	stop                                  chan struct{}
+	rows                                  [][3]string
+	mu                                    sync.Mutex
+	work                                  []func()
 }
 
 func wide(value string) *uint16 {
@@ -123,7 +119,7 @@ func (a *application) control(class, value string, style, exStyle uintptr, id, x
 	return handle
 }
 
-func (a *application) makeUI() {
+func (a *application) makeUI() error {
 	label := func(value string, x, y, w, h int) uintptr {
 		return a.control("STATIC", value, 0, 0, 0, x, y, w, h)
 	}
@@ -132,7 +128,8 @@ func (a *application) makeUI() {
 	const edit = 0x0080
 	const combo = 0x00210003
 
-	label("网关模组分析    "+version, 20, 16, 665, 24)
+	label("网关模组分析    "+version, 20, 16, 505, 24)
+	a.updateButton = a.control("BUTTON", "检查更新", tabstop, 0, updateID, 576, 10, 147, 31)
 	label("TCP 端口", 20, 54, 76, 24)
 	a.port = a.control("EDIT", "7115", tabstop|edit|0x2000, edge, 0, 96, 50, 72, 28)
 	label("采样秒数", 188, 54, 76, 24)
@@ -145,21 +142,8 @@ func (a *application) makeUI() {
 	a.stopButton = a.control("BUTTON", "停止", tabstop, 0, stopID, 641, 49, 82, 30)
 	a.status = label("请选择采样方式，定位服务可继续运行。", 20, 94, 703, 23)
 
-	label("网关", 20, 129, 48, 22)
-	a.gateway = a.control("COMBOBOX", "", combo, 0, gatewayID, 68, 124, 655, 205)
-	a.detail = label("等待网关数据", 20, 163, 703, 26)
-	label("模组 1 · 通道 0–7", 20, 199, 336, 24)
-	label("模组 2 · 通道 8–15", 380, 199, 343, 24)
-	const readOnly = 0x0804
-	a.first = a.control("EDIT", "", readOnly, edge, 0, 20, 222, 339, 204)
-	a.second = a.control("EDIT", "", readOnly, edge, 0, 380, 222, 343, 204)
-	a.diagnostics = label("", 20, 440, 703, 65)
-
-	label("GitHub 只读令牌", 20, 521, 120, 23)
-	a.token = a.control("EDIT", os.Getenv("GATEWAY_ANALYZER_GITHUB_TOKEN"),
-		tabstop|edit|0x0020, edge, 0, 142, 516, 418, 29)
-	a.updateButton = a.control("BUTTON", "检查更新", tabstop, 0, updateID, 576, 515, 147, 31)
 	a.setBusy(false)
+	return a.makeGatewayList()
 }
 
 func (a *application) post(fn func()) {
@@ -176,7 +160,6 @@ func (a *application) setBusy(value bool) {
 	enabled(a.port, !value)
 	enabled(a.duration, !value)
 	enabled(a.mode, !value)
-	enabled(a.token, !value)
 	enabled(a.updateButton, !value)
 }
 
@@ -194,10 +177,7 @@ func (a *application) beginCapture() {
 	stop := make(chan struct{})
 	a.stop, a.stopping = stop, false
 	a.setBusy(true)
-	a.sample = nil
-	a.gatewayIDs = nil
-	send.Call(a.gateway, cbReset, 0, 0)
-	a.showGateway()
+	a.showGateways(nil)
 	text(a.status, "正在打开旁路抓包…")
 	go func() {
 		duration := time.Duration(seconds) * time.Second
@@ -212,7 +192,7 @@ func (a *application) beginCapture() {
 		var err error
 		if live {
 			sample, err = capture.RunLive(uint16(port), duration, stop, status,
-				func(partial *capture.Sample) { a.post(func() { a.showSample(partial) }) })
+				func(partial *capture.Sample) { a.post(func() { a.showGateways(partial.Report.Gateways) }) })
 		} else {
 			sample, err = capture.Run(uint16(port), duration, stop, status)
 		}
@@ -220,13 +200,13 @@ func (a *application) beginCapture() {
 			a.stop, a.stopping = nil, false
 			a.setBusy(false)
 			if sample != nil {
-				a.showSample(sample)
+				a.showGateways(sample.Report.Gateways)
 			}
 			if err != nil {
 				text(a.status, "采样出现错误")
 				messageBox(a.window, "采样出现错误", err.Error(), 0x30)
 			} else {
-				text(a.status, "采样结束")
+				text(a.status, sampleStatus(sample))
 			}
 			if a.closing {
 				user32.NewProc("DestroyWindow").Call(a.window)
@@ -244,107 +224,29 @@ func (a *application) stopCapture() {
 	}
 }
 
-func (a *application) showSample(sample *capture.Sample) {
-	previous := comboGet(a.gateway)
-	var selected string
-	if previous >= 0 && previous < len(a.gatewayIDs) {
-		selected = a.gatewayIDs[previous]
-	}
-	a.sample = sample
-	gateways := sample.Report.Gateways
-	same := len(a.gatewayIDs) == len(gateways)
-	for i, gateway := range gateways {
-		same = same && a.gatewayIDs[i] == gateway.ID
-	}
-	if !same {
-		send.Call(a.gateway, cbReset, 0, 0)
-		a.gatewayIDs = a.gatewayIDs[:0]
-		index, most := -1, uint64(0)
-		for i, gateway := range gateways {
-			a.gatewayIDs = append(a.gatewayIDs, gateway.ID)
-			label := gateway.ID
-			if gateway.MAC != "" {
-				label = gateway.MAC + "   " + gateway.Address
-			}
-			comboAdd(a.gateway, label)
-			total := gateway.Modules[0] + gateway.Modules[1]
-			if gateway.ID == selected {
-				index = i
-			}
-			if selected == "" && (index < 0 || total > most) {
-				index, most = i, total
-			}
-		}
-		if index >= 0 {
-			comboSet(a.gateway, index)
-		}
-	}
-	a.showGateway()
-}
-
-func (a *application) showGateway() {
-	if a.sample == nil {
-		text(a.detail, "等待网关数据")
-		text(a.first, "")
-		text(a.second, "")
-		text(a.diagnostics, "")
-		return
-	}
-	report := a.sample.Report
-	quality := fmt.Sprintf("采样 %.1f 秒 · TCP 包 %d · 有效 ETHE 帧 %d · TCP 缺口 %d · 抓包丢失/截断 %d/%d",
-		a.sample.Duration.Seconds(), report.TCPPackets, report.OuterFrames, report.TCPGaps,
-		report.CaptureDropped, report.CaptureTruncated)
-	quality += fmt.Sprintf("\r\n外帧校验异常 %d · 边界半帧 %d · 不支持的网络包 %d",
-		report.BadOuterFrames, report.PartialOuterFrames, report.UnsupportedPackets)
-	if a.sample.PossibleFileCap {
-		quality += " · 日志可能已覆盖"
-	}
-	if a.sample.Warning != "" {
-		quality += "\r\n" + a.sample.Warning
-	}
-	text(a.diagnostics, quality)
-
-	index := comboGet(a.gateway)
-	if index < 0 || index >= len(report.Gateways) {
-		text(a.detail, "本次采样尚无可识别的网关")
-		text(a.first, "")
-		text(a.second, "")
-		return
-	}
-	gateway := report.Gateways[index]
-	one, two := gateway.Modules[0], gateway.Modules[1]
-	state := "两个模组均观察到上报"
-	if one == 0 && two == 0 {
-		state = "尚未观察到人员卡上报"
-	} else if one == 0 || two == 0 {
-		state = "当前只观察到单侧上报"
-		if a.stop == nil {
-			state = "单侧为零，请用两组已知卡复测"
-		}
+func sampleStatus(sample *capture.Sample) string {
+	report := sample.Report
+	status := "采样结束"
+	if len(report.Gateways) == 0 {
+		status += "，未识别到网关"
 	}
 	if report.TCPGaps != 0 || report.CaptureDropped != 0 || report.CaptureTruncated != 0 ||
-		report.UnsupportedPackets != 0 || report.BadOuterFrames != 0 || gateway.BadInnerFrames != 0 || gateway.UnknownBytes != 0 ||
-		a.sample.PossibleFileCap || a.sample.Warning != "" {
-		state += " · 采样可能不完整"
+		report.UnsupportedPackets != 0 || report.BadOuterFrames != 0 || sample.PossibleFileCap || sample.Warning != "" {
+		return status + "，采样可能不完整"
 	}
-	text(a.detail, fmt.Sprintf("卡号去重 %d · 上报 %d · %s", gateway.UniqueCards, one+two, state))
-	text(a.diagnostics, quality+fmt.Sprintf(" · 所选网关内帧异常 %d、未识别 %d 字节",
-		gateway.BadInnerFrames, gateway.UnknownBytes))
-	for module, control := range []uintptr{a.first, a.second} {
-		var lines strings.Builder
-		fmt.Fprintf(&lines, "合计上报    %d\r\n\r\n", gateway.Modules[module])
-		for channel := module * 8; channel < module*8+8; channel++ {
-			fmt.Fprintf(&lines, "通道 %02d       %d\r\n", channel, gateway.Channels[channel])
+	for _, gateway := range report.Gateways {
+		if gateway.BadInnerFrames != 0 || gateway.UnknownBytes != 0 {
+			return status + "，部分报文未计入"
 		}
-		text(control, lines.String())
 	}
+	return status
 }
 
 func (a *application) checkUpdate() {
 	if a.busy {
 		return
 	}
-	github := update.NewGitHub(releaseRepo, read(a.token))
+	github := update.NewGitHub(releaseRepo)
 	a.setBusy(true)
 	text(a.status, "正在从 GitHub 检查更新…")
 	go func() {
@@ -410,10 +312,6 @@ func windowProc(window uintptr, event uint32, w, l uintptr) uintptr {
 				app.stopCapture()
 			case updateID:
 				app.checkUpdate()
-			case gatewayID:
-				if uint16(w>>16) == 1 {
-					app.showGateway()
-				}
 			}
 			return 0
 		case wmWork:
@@ -479,12 +377,15 @@ func gui() error {
 	}
 	window, _, err := create.Call(0, uintptr(unsafe.Pointer(class.className)),
 		uintptr(unsafe.Pointer(wide("网关模组分析"))), 0x00ca0000,
-		0x80000000, 0x80000000, app.px(764), app.px(601), 0, 0, instance, 0)
+		0x80000000, 0x80000000, app.px(764), app.px(497), 0, 0, instance, 0)
 	if window == 0 {
 		return err
 	}
 	app.window = window
-	app.makeUI()
+	if err := app.makeUI(); err != nil {
+		user32.NewProc("DestroyWindow").Call(window)
+		return err
+	}
 	user32.NewProc("ShowWindow").Call(window, 1)
 	var msg message
 	for {
