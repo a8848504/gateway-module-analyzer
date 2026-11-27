@@ -263,11 +263,15 @@ func sampleStatus(sample *capture.Sample) string {
 		count uint64
 	}{
 		{"TCP 缺口", report.TCPGaps}, {"抓包丢失", report.CaptureDropped}, {"截断", report.CaptureTruncated},
-		{"外帧校验错误", report.BadOuterFrames}, {"无法解析的网络包", report.UnsupportedPackets},
+		{"加密上报未统计", report.EncryptedOuterFrames}, {"无法解析的网络包", report.UnsupportedPackets},
 	} {
 		if issue.count != 0 {
 			issues = append(issues, fmt.Sprintf("%s %d", issue.label, issue.count))
 		}
+	}
+	if report.BadOuterFrames != 0 {
+		issues = append(issues, fmt.Sprintf("外帧错误 %d（帧尾 %d，校验和 %d）",
+			report.BadOuterFrames, report.BadOuterTail, report.BadOuterChecksum))
 	}
 	var unknownBytes, badInnerFrames uint64
 	for _, gateway := range report.Gateways {

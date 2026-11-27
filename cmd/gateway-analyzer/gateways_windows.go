@@ -126,6 +126,8 @@ func (a *application) showGateways(gateways []*analyze.Gateway) {
 			label = gateway.MAC
 			if gateway.Address != "" {
 				label += "   " + gateway.Address
+			} else if gateway.SIMHex != "" {
+				label += "   SIM " + gateway.SIMHex
 			}
 		}
 		first, second := gateway.Modules[0], gateway.Modules[1]

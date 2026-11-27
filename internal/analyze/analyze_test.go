@@ -71,6 +71,68 @@ func TestCardReports(t *testing.T) {
 	}
 }
 
+func TestEthernetAndCellularPackaging(t *testing.T) {
+	makeFrame := func(kind, direction, gateway byte, prefix []byte, card uint32) []byte {
+		frame := wrap(rFrame(card), gateway)
+		frame[6], frame[7] = kind, direction
+		copy(frame[len(frame)-14:], prefix)
+		frame[len(frame)-2] = 0
+		return seal(frame, 4)
+	}
+	sim := []byte{0x01, 0x23, 0x45, 0x67, 0x89, 0xab}
+	data := bytes.Join([][]byte{
+		makeFrame(ethernetGateway, 1, 1, nil, 0x12345600),
+		makeFrame(plaintextEthernetGateway, 1, 1, nil, 0x12345608),
+		makeFrame(plaintextCellularGateway, 1, 2, sim, 0x1234560f),
+		makeFrame(plaintextCellularGateway, 1, 2, []byte{1, 2, 3, 4, 5, 6}, 0x12345607),
+		makeFrame(plaintextEthernetGateway, etheDownlink, 3, nil, 0x12345600),
+		makeFrame(encryptionHandshake, 1, 4, nil, 0x12345600),
+		makeFrame(encryptedEthernetGateway, 1, 5, nil, 0x12345600),
+		makeFrame(encryptedCellularGateway, 1, 6, nil, 0x12345600),
+	}, nil)
+	report, err := ReadStream(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.OuterFrames != 8 || report.BadOuterFrames != 0 || report.DownlinkOuterFrames != 1 ||
+		report.HandshakeOuterFrames != 1 || report.EncryptedOuterFrames != 2 || len(report.Gateways) != 2 {
+		t.Fatalf("incorrect outer frame classification: %+v", report)
+	}
+	for _, gateway := range report.Gateways {
+		if gateway.Modules != [2]uint64{1, 1} || gateway.UnknownBytes != 0 {
+			t.Fatalf("incorrect plaintext card data: %+v", gateway)
+		}
+		switch gateway.MAC {
+		case "02:2C:21:16:0B:01":
+			if gateway.Address != "192.0.2.1:5000" || gateway.SIMHex != "" {
+				t.Fatalf("incorrect ethernet identity: %+v", gateway)
+			}
+		case "02:2C:21:16:0B:02":
+			if gateway.Address != "" || gateway.SIMHex != "0123456789AB" {
+				t.Fatalf("incorrect cellular identity: %+v", gateway)
+			}
+		default:
+			t.Fatalf("unexpected gateway: %+v", gateway)
+		}
+	}
+}
+
+func TestOuterFrameFailureBreakdown(t *testing.T) {
+	tail := wrap(rFrame(0x12345600), 1)
+	tail[len(tail)-1] = 'X'
+	checksum := wrap(rFrame(0x12345601), 1)
+	checksum[len(checksum)-2]++
+	valid := wrap(rFrame(0x12345608), 1)
+	report, err := ReadStream(bytes.NewReader(bytes.Join([][]byte{tail, checksum, valid}, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.BadOuterFrames != 2 || report.BadOuterTail != 1 || report.BadOuterChecksum != 1 ||
+		report.OuterFrames != 1 || len(report.Gateways) != 1 || report.Gateways[0].Modules != [2]uint64{0, 1} {
+		t.Fatalf("bad outer candidates were counted or misclassified: %+v", report)
+	}
+}
+
 func tcpPacket(t *testing.T, seq uint32, syn bool, dest uint16, src, dst string, data []byte) []byte {
 	t.Helper()
 	ip := &layers.IPv4{Version: 4, TTL: 64, SrcIP: net.ParseIP(src), DstIP: net.ParseIP(dst), Protocol: layers.IPProtocolTCP}

@@ -119,6 +119,11 @@ func TestGatewayListShowsAllGateways(t *testing.T) {
 	a.showGateways([]*analyze.Gateway{first, second})
 	assertRows([4]string{"02:00:00:00:00:01   192.0.2.1:5000", "100", "60", "正常"}, [4]string{"G2", "0", "8", "异常"})
 	assertColor(0, normalColor)
+	second.MAC = "02:00:00:00:00:02"
+	second.SIMHex = "0123456789AB"
+	a.showGateways([]*analyze.Gateway{first, second})
+	assertRows([4]string{"02:00:00:00:00:01   192.0.2.1:5000", "100", "60", "正常"},
+		[4]string{"02:00:00:00:00:02   SIM 0123456789AB", "0", "8", "异常"})
 	a.showGateways(nil)
 	assertRows()
 }

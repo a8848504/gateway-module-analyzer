@@ -5,6 +5,17 @@ import (
 	"encoding/binary"
 )
 
+const (
+	ethernetGateway          = 0x01
+	ethernetHeartbeat        = 0x06
+	encryptionHandshake      = 0x08
+	encryptedEthernetGateway = 0x09
+	encryptedCellularGateway = 0x0a
+	plaintextEthernetGateway = 0x0b
+	plaintextCellularGateway = 0x0c
+	etheDownlink             = 0x02
+)
+
 // The length rules for C, L, R, TA and the observed TO/01/24 variant
 // are shared with the positioning TCP recorder.
 var cLengths = map[byte][2]int{
@@ -93,14 +104,19 @@ func (d *decoder) feed(data []byte) {
 			break
 		}
 		frame := d.buffer[:size]
-		if frame[size-1] != 'M' || !sumOK(frame, 4) {
-			d.report.BadOuterFrames++
-			d.buffer = d.buffer[1:]
+		switch {
+		case frame[size-1] != 'M':
+			d.report.BadOuterTail++
+		case !sumOK(frame, 4):
+			d.report.BadOuterChecksum++
+		default:
+			d.report.OuterFrames++
+			d.report.readOuter(frame)
+			d.buffer = d.buffer[size:]
 			continue
 		}
-		d.report.OuterFrames++
-		d.report.readPayload(frame[6], frame[size-14:size-2], frame[8:size-14])
-		d.buffer = d.buffer[size:]
+		d.report.BadOuterFrames++
+		d.buffer = d.buffer[1:]
 	}
 	if len(d.buffer) == 0 {
 		d.buffer = nil
@@ -113,6 +129,23 @@ func (d *decoder) interrupt() {
 		d.report.PartialOuterFrames++
 	}
 	d.buffer = nil
+}
+
+func (r *Report) readOuter(frame []byte) {
+	if frame[7] == etheDownlink {
+		r.DownlinkOuterFrames++
+		return
+	}
+	kind := frame[6]
+	switch kind {
+	case encryptionHandshake:
+		r.HandshakeOuterFrames++
+	case encryptedEthernetGateway, encryptedCellularGateway:
+		r.EncryptedOuterFrames++
+	default:
+		payloadEnd := len(frame) - 14
+		r.readPayload(kind, frame[payloadEnd:len(frame)-2], frame[8:payloadEnd])
+	}
 }
 
 func (r *Report) readPayload(kind byte, gatewayID, payload []byte) {
