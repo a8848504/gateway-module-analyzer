@@ -19,6 +19,10 @@ jobs:
           go-version: stable
       - run: go test -v ./...
       - run: go vet ./...
+      - name: Verify the Netsh compatibility capture
+        env:
+          GATEWAY_TEST_NETSH: '1'
+        run: go test -v ./internal/capture -run '^TestNetshCompatibilityOnWindows$' -count=1 -timeout=3m
       - name: Verify the desktop executable starts
         shell: pwsh
         run: |
@@ -59,6 +63,7 @@ jobs:
               -ldflags "-s -w -H windowsgui -X main.version=$VERSION -X main.releaseRepo=$GITHUB_REPOSITORY" \
               -o "dist/GatewayModuleAnalyzer-Windows-$arch.exe" ./cmd/gateway-analyzer
           done
+          cp internal/capture/third_party/etl2pcapng/LICENSE.txt dist/Microsoft-etl2pcapng-LICENSE.txt
           cd dist
           sha256sum ./*.exe > SHA256SUMS.txt
       - name: Publish GitHub Release
@@ -67,4 +72,5 @@ jobs:
           VERSION: ${{ github.ref_name }}
         run: |
           gh release create "$VERSION" --verify-tag --latest --generate-notes \
-            dist/GatewayModuleAnalyzer-Windows-amd64.exe dist/GatewayModuleAnalyzer-Windows-arm64.exe dist/SHA256SUMS.txt
+            dist/GatewayModuleAnalyzer-Windows-amd64.exe dist/GatewayModuleAnalyzer-Windows-arm64.exe \
+            dist/SHA256SUMS.txt dist/Microsoft-etl2pcapng-LICENSE.txt

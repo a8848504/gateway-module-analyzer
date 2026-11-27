@@ -149,7 +149,7 @@ func (a *application) makeUI() error {
 	label("采样秒数", 188, 54, 76, 24)
 	a.duration = a.control("EDIT", "60", tabstop|edit|0x2000, edge, 0, 264, 50, 70, 28)
 	a.mode = a.control("COMBOBOX", "", combo, 0, 0, 354, 50, 171, 180)
-	comboAdd(a.mode, "结束后统计（Pktmon）")
+	comboAdd(a.mode, "结束后统计（系统抓包）")
 	comboAdd(a.mode, "实时采样（Npcap）")
 	comboSet(a.mode, 0)
 	a.startButton = a.control("BUTTON", "开始", tabstop|1, 0, startID, 547, 49, 82, 30)

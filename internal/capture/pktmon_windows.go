@@ -119,9 +119,13 @@ func Run(port uint16, duration time.Duration, stop <-chan struct{}, status func(
 		return nil, err
 	}
 	pktmon := filepath.Join(directory, "pktmon.exe")
-	help, err := command(15*time.Second, pktmon, "help")
-	if err != nil || (!strings.Contains(strings.ToLower(help), "etl2pcap") && !strings.Contains(strings.ToLower(help), "pcapng")) {
-		return nil, fmt.Errorf("此 Windows 的 Pktmon 无法导出 PCAPNG，请检查系统版本及管理员权限。%v", err)
+	help, _ := command(10*time.Second, pktmon, "help")
+	converter := pktmonConverter(help)
+	if converter != "" {
+		startHelp, _ := command(10*time.Second, pktmon, "start", "help")
+		if !modernPktmonOptions(startHelp) {
+			converter = ""
+		}
 	}
 	sessions, err := command(15*time.Second, filepath.Join(directory, "logman.exe"), "query", "-ets")
 	if err != nil {
@@ -129,6 +133,9 @@ func Run(port uint16, duration time.Duration, stop <-chan struct{}, status func(
 	}
 	if activeSession.MatchString(sessions) {
 		return nil, errors.New("系统已有 Pktmon 抓包会话，请等当前会话结束后再采样")
+	}
+	if converter == "" {
+		return runNetsh(directory, sessions, port, duration, stop, status)
 	}
 	filters, err := command(15*time.Second, pktmon, "filter", "list")
 	if err != nil {
@@ -168,43 +175,74 @@ func Run(port uint16, duration time.Duration, stop <-chan struct{}, status func(
 		strconv.Itoa(fileLimitMiB), "--log-mode", "circular"); err != nil {
 		return nil, fmt.Errorf("启动 Pktmon 失败: %w", err)
 	}
-	start := time.Now()
-	timer := time.NewTimer(duration)
-	defer timer.Stop()
-	ticks := time.NewTicker(time.Second)
-	defer ticks.Stop()
-sampling:
-	for {
-		status(fmt.Sprintf("正在采样 TCP %d · 剩余 %d 秒", port, max(0, int((duration-time.Since(start)).Seconds()+0.99))))
-		select {
-		case <-stop:
-			break sampling
-		case <-timer.C:
-			break sampling
-		case <-ticks.C:
-		}
-	}
-	elapsed := time.Since(start)
+	elapsed := waitSampling(port, duration, stop, status)
 	status("正在停止采样并整理报文…")
 	if _, err := command(40*time.Second, pktmon, "stop"); err != nil {
 		keepCapture = true
 		return nil, fmt.Errorf("停止 Pktmon 失败，采样文件位于 %s：%w", work, err)
 	}
+	converted := filepath.Join(work, "capture.pcapng")
+	if _, err := command(90*time.Second, pktmon, converter, recording, "--out", converted); err != nil {
+		alternate := "pcapng"
+		if converter == alternate {
+			alternate = "etl2pcap"
+		}
+		if _, alternateErr := command(90*time.Second, pktmon, alternate, recording, "--out", converted); alternateErr != nil {
+			keepCapture = true
+			return nil, fmt.Errorf("转换采样文件失败，原始数据位于 %s：%w", work, errors.Join(err, alternateErr))
+		}
+	}
+	sample, err := analyzeCapture(recording, converted, port, local, elapsed, status)
+	if err != nil {
+		keepCapture = true
+		return nil, fmt.Errorf("分析失败，原始数据位于 %s：%w", work, err)
+	}
+	return sample, nil
+}
+
+func pktmonConverter(help string) string {
+	help = strings.ToLower(help)
+	if strings.Contains(help, "etl2pcap") {
+		return "etl2pcap"
+	}
+	if strings.Contains(help, "pcapng") {
+		return "pcapng"
+	}
+	return ""
+}
+
+func modernPktmonOptions(help string) bool {
+	help = strings.ToLower(help)
+	return strings.Contains(help, "--capture") && strings.Contains(help, "--pkt-size") &&
+		strings.Contains(help, "--log-mode") && strings.Contains(help, "--type")
+}
+
+func waitSampling(port uint16, duration time.Duration, stop <-chan struct{}, status func(string)) time.Duration {
+	start := time.Now()
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	ticks := time.NewTicker(time.Second)
+	defer ticks.Stop()
+	for {
+		status(fmt.Sprintf("正在采样 TCP %d · 剩余 %d 秒", port, max(0, int((duration-time.Since(start)).Seconds()+0.99))))
+		select {
+		case <-stop:
+			return time.Since(start)
+		case <-timer.C:
+			return time.Since(start)
+		case <-ticks.C:
+		}
+	}
+}
+
+func analyzeCapture(recording, converted string, port uint16, local map[netip.Addr]bool, elapsed time.Duration, status func(string)) (*Sample, error) {
 	capInfo, err := os.Stat(recording)
 	if err != nil {
 		return nil, fmt.Errorf("系统未生成采样文件: %w", err)
 	}
-	converted := filepath.Join(work, "capture.pcapng")
-	if _, err := command(90*time.Second, pktmon, "etl2pcap", recording, "--out", converted); err != nil {
-		if _, fallback := command(90*time.Second, pktmon, "pcapng", recording, "--out", converted); fallback != nil {
-			keepCapture = true
-			return nil, fmt.Errorf("转换采样文件失败，原始数据位于 %s：%w", work, errors.Join(err, fallback))
-		}
-	}
 	file, err := os.Open(converted)
 	if err != nil {
-		keepCapture = true
-		return nil, fmt.Errorf("无法打开转换结果，原始数据位于 %s：%w", work, err)
+		return nil, fmt.Errorf("无法打开 PCAPNG 转换结果: %w", err)
 	}
 	defer file.Close()
 	status("正在重组 TCP 和统计人员卡通道…")
@@ -212,8 +250,7 @@ sampling:
 	defer cancel()
 	report, err := analyze.ReadCapture(ctx, file, port, local)
 	if err != nil {
-		keepCapture = true
-		return nil, fmt.Errorf("分析失败，原始数据位于 %s：%w", work, err)
+		return nil, err
 	}
 	return &Sample{Report: report, Duration: elapsed, PossibleFileCap: capInfo.Size() >= (fileLimitMiB-1)<<20}, nil
 }

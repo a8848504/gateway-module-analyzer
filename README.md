@@ -6,10 +6,12 @@ Windows 桌面工具。部署在接收网关数据的定位服务器上，按 TC
 
 1. 从 [GitHub Releases](https://github.com/a8848504/gateway-module-analyzer/releases/latest) 下载对应的 EXE。普通 Intel 或 AMD 电脑选 `Windows-amd64`，Windows on ARM 选 `Windows-arm64`。运行时接受 Windows 管理员权限提示。
 2. 输入定位服务正在接收的 TCP 端口，默认 `7115`。填写采样时间，默认 60 秒。
-3. 默认选中 **结束后统计（Pktmon）**。该模式需要系统支持 `pktmon etl2pcap` 或兼容的 `pktmon pcapng` 命令。已安装 [Npcap](https://npcap.com/#download) 时也可选 **实时采样（Npcap）**，约每秒刷新一次。程序没有内置 Npcap 安装包。
+3. 默认选中 **结束后统计（系统抓包）**。系统支持 Pktmon 导出 PCAPNG 时优先使用 Pktmon。缺少该能力的 Windows Server 2019 等系统自动使用 Netsh 和内置的 Microsoft etl2pcapng 转换器。已安装 [Npcap](https://npcap.com/#download) 时也可选 **实时采样（Npcap）**，约每秒刷新一次。
 4. 点击 **开始**。结果列表自动展示检测到的所有网关及两个模组的累计上报条数。可随时按 **停止** 结束采样并保留统计结果。
 
-采样期间，原定位程序继续占用原 TCP 端口。启用旁路采样会产生少量抓包和解析开销。Pktmon 使用系统级会话，已有 Pktmon 会话或筛选规则时，程序会让管理员先检查其状态。
+采样期间，原定位程序继续使用原 TCP 端口。Netsh 兼容模式会临时收集本机 TCP 流量，限制日志大小，并在分析时按指定的本机目标端口筛选。Pktmon 和 Netsh 使用系统级采样会话。程序会检查现有会话，Netsh 停止前也会核对本次采样的文件路径。
+
+[Microsoft etl2pcapng 来源和许可证](internal/capture/third_party/etl2pcapng/README.md)
 
 ### 统计口径
 

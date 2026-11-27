@@ -28,7 +28,7 @@ func TestGatewayListShowsAllGateways(t *testing.T) {
 	if comboGet(a.mode) != 0 {
 		t.Fatal("Pktmon should be selected by default")
 	}
-	for i, want := range []string{"结束后统计（Pktmon）", "实时采样（Npcap）"} {
+	for i, want := range []string{"结束后统计（系统抓包）", "实时采样（Npcap）"} {
 		var label [128]uint16
 		send.Call(a.mode, 0x0148, uintptr(i), uintptr(unsafe.Pointer(&label[0]))) // CB_GETLBTEXT
 		if got := windows.UTF16ToString(label[:]); got != want {
