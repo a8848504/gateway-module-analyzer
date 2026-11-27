@@ -1,0 +1,6 @@
+/dist/
+*.etl
+*.pcap
+*.pcapng
+*.bin
+__pycache__/
