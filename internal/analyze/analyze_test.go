@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"net"
 	"net/netip"
+	"slices"
 	"testing"
 	"time"
 
@@ -80,22 +81,30 @@ func TestEthernetAndCellularPackaging(t *testing.T) {
 		return seal(frame, 4)
 	}
 	sim := []byte{0x01, 0x23, 0x45, 0x67, 0x89, 0xab}
+	ethernetFirst := makeFrame(ethernetGateway, 1, 1, nil, 0x12345600)
+	cellularFirst := makeFrame(plaintextCellularGateway, 1, 2, sim, 0x1234560f)
+	gprsHeartbeat := wrap(nil, 3)
+	gprsHeartbeat[6], gprsHeartbeat[len(gprsHeartbeat)-2] = 0x03, 0
+	seal(gprsHeartbeat, 4)
 	data := bytes.Join([][]byte{
-		makeFrame(ethernetGateway, 1, 1, nil, 0x12345600),
+		ethernetFirst,
 		makeFrame(plaintextEthernetGateway, 1, 1, nil, 0x12345608),
-		makeFrame(plaintextCellularGateway, 1, 2, sim, 0x1234560f),
+		cellularFirst,
 		makeFrame(plaintextCellularGateway, 1, 2, []byte{1, 2, 3, 4, 5, 6}, 0x12345607),
 		makeFrame(plaintextEthernetGateway, etheDownlink, 3, nil, 0x12345600),
 		makeFrame(encryptionHandshake, 1, 4, nil, 0x12345600),
 		makeFrame(encryptedEthernetGateway, 1, 5, nil, 0x12345600),
 		makeFrame(encryptedCellularGateway, 1, 6, nil, 0x12345600),
+		gprsHeartbeat,
+		makeFrame(0x02, 1, 3, nil, 0x12345601),
+		makeFrame(0x02, 1, 3, nil, 0x1234560f),
 	}, nil)
 	report, err := ReadStream(bytes.NewReader(data))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.OuterFrames != 8 || report.BadOuterFrames != 0 || report.DownlinkOuterFrames != 1 ||
-		report.HandshakeOuterFrames != 1 || report.EncryptedOuterFrames != 2 || len(report.Gateways) != 2 {
+	if report.OuterFrames != 11 || report.BadOuterFrames != 0 || report.DownlinkOuterFrames != 1 ||
+		report.HandshakeOuterFrames != 1 || report.EncryptedOuterFrames != 2 || len(report.Gateways) != 3 {
 		t.Fatalf("incorrect outer frame classification: %+v", report)
 	}
 	for _, gateway := range report.Gateways {
@@ -104,12 +113,19 @@ func TestEthernetAndCellularPackaging(t *testing.T) {
 		}
 		switch gateway.MAC {
 		case "02:2C:21:16:0B:01":
-			if gateway.Address != "192.0.2.1:5000" || gateway.SIMHex != "" {
+			if gateway.Address != "192.0.2.1:5000" || gateway.SIMHex != "" ||
+				!slices.Equal(gateway.DeviceTypes, []int{0x01, 0x0b}) || gateway.FirstFrame != string(ethernetFirst) {
 				t.Fatalf("incorrect ethernet identity: %+v", gateway)
 			}
 		case "02:2C:21:16:0B:02":
-			if gateway.Address != "" || gateway.SIMHex != "0123456789AB" {
+			if gateway.Address != "" || gateway.SIMHex != "0123456789AB" ||
+				!slices.Equal(gateway.DeviceTypes, []int{0x0c}) || gateway.FirstFrame != string(cellularFirst) {
 				t.Fatalf("incorrect cellular identity: %+v", gateway)
+			}
+		case "":
+			if gateway.ID != "C00002011388022C21160B03" ||
+				!slices.Equal(gateway.DeviceTypes, []int{0x02, 0x03}) || gateway.FirstFrame != string(gprsHeartbeat) {
+				t.Fatalf("incorrect GPRS identity: %+v", gateway)
 			}
 		default:
 			t.Fatalf("unexpected gateway: %+v", gateway)
@@ -194,7 +210,8 @@ func TestLiveAndPCAPNGReassembly(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, report := range []*Report{offline, session.Finish(0)} {
-		if len(report.Gateways) != 1 || report.Gateways[0].Modules != [2]uint64{1, 1} || report.TCPGaps != 0 {
+		if len(report.Gateways) != 1 || report.Gateways[0].Modules != [2]uint64{1, 1} || report.TCPGaps != 0 ||
+			report.Gateways[0].FirstFrame != string(first) {
 			t.Fatalf("recovery, retransmission or direction failed: %+v", report)
 		}
 	}

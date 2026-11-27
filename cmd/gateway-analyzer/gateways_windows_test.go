@@ -36,10 +36,19 @@ func TestGatewayListShowsAllGateways(t *testing.T) {
 		}
 	}
 	header, _, _ := send.Call(a.list, 0x101f, 0, 0) // LVM_GETHEADER
-	if count, _, _ := send.Call(header, 0x1200, 0, 0); count != 5 {
-		t.Fatalf("expected five columns, got %d", count)
+	columns := []string{"网关", "类型", "模组 1 数量", "模组 2 数量", "结论", "首帧"}
+	if count, _, _ := send.Call(header, 0x1200, 0, 0); int(count) != len(columns) {
+		t.Fatalf("expected %d columns, got %d", len(columns), count)
 	}
-	assertRows := func(want ...gatewayRow) {
+	for i, want := range columns {
+		var buffer [32]uint16
+		entry := listColumn{mask: 4, text: &buffer[0], textMax: int32(len(buffer))}
+		send.Call(a.list, 0x105f, uintptr(i), uintptr(unsafe.Pointer(&entry))) // LVM_GETCOLUMNW
+		if got := windows.UTF16ToString(buffer[:]); got != want {
+			t.Fatalf("column %d = %q, want %q", i, got, want)
+		}
+	}
+	assertRows := func(want ...gatewayCells) {
 		t.Helper()
 		if count, _, _ := send.Call(a.list, 0x1004, 0, 0); int(count) != len(want) {
 			t.Fatalf("row count = %d, want %d", count, len(want))
@@ -110,28 +119,77 @@ func TestGatewayListShowsAllGateways(t *testing.T) {
 			t.Fatalf("row %d conclusion color = %#x, want %#x", row, draw.textColor, want)
 		}
 	}
-	first := &analyze.Gateway{ID: "G1", MAC: "02:00:00:00:00:01", Address: "192.0.2.1:5000", Modules: [2]uint64{5, 0}}
-	second := &analyze.Gateway{ID: "G2", Modules: [2]uint64{0, 8}}
+	first := &analyze.Gateway{ID: "G1", MAC: "02:00:00:00:00:01", Address: "192.0.2.1:5000",
+		DeviceTypes: []int{1, 6}, FirstFrame: "ETHE\x00\x00\x01\x01" + strings.Repeat("\x01", 12) + "\x0EM", Modules: [2]uint64{5, 0}}
+	second := &analyze.Gateway{ID: "G2", DeviceTypes: []int{2},
+		FirstFrame: "ETHE\x9c\x40\x02\x01" + strings.Repeat("\xCD", 40000) + strings.Repeat("\x02", 12) + "\x17M", Modules: [2]uint64{0, 8}}
 	a.showGateways([]*analyze.Gateway{first, second})
-	assertRows(gatewayRow{"02:00:00:00:00:01   192.0.2.1:5000", "", "5", "0", "异常"},
-		gatewayRow{"G2", "", "0", "8", "异常"})
+	assertRows(gatewayCells{"02:00:00:00:00:01   192.0.2.1:5000", "0x01, 0x06", "5", "0", "异常", "查看"},
+		gatewayCells{"G2", "0x02", "0", "8", "异常", "查看"})
 	assertColor(0, abnormalColor)
 	first.Modules = [2]uint64{100, 60}
+	second.DeviceTypes = []int{2, 3}
 	a.showGateways([]*analyze.Gateway{first, second})
-	assertRows(gatewayRow{"02:00:00:00:00:01   192.0.2.1:5000", "", "100", "60", "正常"},
-		gatewayRow{"G2", "", "0", "8", "异常"})
+	assertRows(gatewayCells{"02:00:00:00:00:01   192.0.2.1:5000", "0x01, 0x06", "100", "60", "正常", "查看"},
+		gatewayCells{"G2", "0x02, 0x03", "0", "8", "异常", "查看"})
 	assertColor(0, normalColor)
 	second.MAC = "02:00:00:00:00:02"
 	second.SIMHex = "0123456789AB"
+	second.DeviceTypes = []int{0x0c}
 	a.showGateways([]*analyze.Gateway{first, second})
-	assertRows(gatewayRow{"02:00:00:00:00:01   192.0.2.1:5000", "", "100", "60", "正常"},
-		gatewayRow{"02:00:00:00:00:02", "0123456789AB", "0", "8", "异常"})
+	assertRows(gatewayCells{"02:00:00:00:00:01   192.0.2.1:5000", "0x01, 0x06", "100", "60", "正常", "查看"},
+		gatewayCells{"02:00:00:00:00:02", "0x0C", "0", "8", "异常", "查看"})
 	second.Address = "192.0.2.2:5000"
 	a.showGateways([]*analyze.Gateway{second})
-	assertRows(gatewayRow{"02:00:00:00:00:02   192.0.2.2:5000", "0123456789AB", "0", "8", "异常"})
+	assertRows(gatewayCells{"02:00:00:00:00:02   192.0.2.2:5000", "0x0C", "0", "8", "异常", "查看"})
 	assertColor(0, abnormalColor)
+	assertRawFrameDialog(t, &a, second.FirstFrame)
 	a.showGateways(nil)
 	assertRows()
+}
+
+func assertRawFrameDialog(t *testing.T, a *application, frame string) {
+	t.Helper()
+	bounds := [4]int32{0, rawFrameColumn}
+	if found, _, _ := send.Call(a.list, 0x1038, 0, uintptr(unsafe.Pointer(&bounds[0]))); found == 0 { // LVM_GETSUBITEMRECT
+		t.Fatal("first row has no raw-frame cell")
+	}
+	click := listClick{header: notifyHeader{source: a.list, code: nmClick},
+		position: [2]int32{(bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2}}
+	var pin runtime.Pinner
+	pin.Pin(&click)
+	defer pin.Unpin()
+	windowProc(a.window, wmNotify, 0, uintptr(unsafe.Pointer(&click)))
+	if len(a.work) != 1 {
+		t.Fatal("clicking the first-frame cell did not queue a dialog")
+	}
+	var opened bool
+	timerProc := windows.NewCallback(func(_ uintptr, _ uint32, _ uintptr, _ uint32) uintptr {
+		dialog, _, _ := user32.NewProc("FindWindowW").Call(0, uintptr(unsafe.Pointer(wide(rawDialogTitle))))
+		if dialog == 0 {
+			return 0
+		}
+		opened = true
+		edit, _, _ := user32.NewProc("GetDlgItem").Call(dialog, rawFrameEdit)
+		length, _, _ := user32.NewProc("GetWindowTextLengthW").Call(edit)
+		if want := len(rawFrameHex(frame)); int(length) != want {
+			t.Errorf("raw-frame display length = %d, want %d", length, want)
+		}
+		if got := read(edit); !strings.HasPrefix(got, "45 54 48 45 9C 40 02 01 CD CD") {
+			t.Errorf("raw-frame dialog opened unexpected bytes: %.80s", got)
+		}
+		user32.NewProc("PostMessageW").Call(dialog, wmClose, 0, 0)
+		return 0
+	})
+	timer, _, err := user32.NewProc("SetTimer").Call(a.window, 1, 30, timerProc)
+	if timer == 0 {
+		t.Fatalf("cannot schedule raw-frame dialog check: %v", err)
+	}
+	defer user32.NewProc("KillTimer").Call(a.window, timer)
+	windowProc(a.window, wmWork, 0, 0)
+	if !opened {
+		t.Fatal("raw-frame dialog did not open")
+	}
 }
 
 func TestModuleConclusionThreshold(t *testing.T) {

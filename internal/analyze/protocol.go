@@ -144,15 +144,17 @@ func (r *Report) readOuter(frame []byte) {
 		r.EncryptedOuterFrames++
 	default:
 		payloadEnd := len(frame) - 14
-		r.readPayload(kind, frame[payloadEnd:len(frame)-2], frame[8:payloadEnd])
+		gateway := r.gateway(kind, frame[payloadEnd:len(frame)-2])
+		if gateway != nil {
+			if gateway.FirstFrame == "" {
+				gateway.FirstFrame = string(frame)
+			}
+			gateway.readPayload(frame[8:payloadEnd])
+		}
 	}
 }
 
-func (r *Report) readPayload(kind byte, gatewayID, payload []byte) {
-	gateway := r.gateway(kind, gatewayID)
-	if gateway == nil {
-		return
-	}
+func (gateway *Gateway) readPayload(payload []byte) {
 	for len(payload) >= 8 {
 		size, checksum, offset, count, stride, tail := innerLayout(payload)
 		if size == 0 || size > len(payload) {

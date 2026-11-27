@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/netip"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -16,6 +17,8 @@ type Gateway struct {
 	MAC            string     `json:"gateway_mac,omitempty"`
 	Address        string     `json:"reported_address,omitempty"`
 	SIMHex         string     `json:"sim_hex,omitempty"`
+	DeviceTypes    []int      `json:"device_types"`
+	FirstFrame     string     `json:"-"` // Immutable wire bytes shared by live snapshots.
 	Channels       [16]uint64 `json:"channels"`
 	Modules        [2]uint64  `json:"modules"`
 	UniqueCards    int        `json:"unique_cards"`
@@ -84,6 +87,9 @@ func (r *Report) gateway(kind byte, raw []byte) *Gateway {
 	if gateway.SIMHex == "" {
 		gateway.SIMHex = sim
 	}
+	if deviceType := int(kind); !slices.Contains(gateway.DeviceTypes, deviceType) {
+		gateway.DeviceTypes = append(gateway.DeviceTypes, deviceType)
+	}
 	return gateway
 }
 
@@ -99,6 +105,8 @@ func (r *Report) snapshot() *Report {
 	result.Gateways = make([]*Gateway, 0, len(r.Gateways))
 	for _, gateway := range r.Gateways {
 		copy := *gateway
+		copy.DeviceTypes = slices.Clone(gateway.DeviceTypes)
+		slices.Sort(copy.DeviceTypes)
 		copy.UniqueCards = len(gateway.cards)
 		copy.cards = nil
 		result.Gateways = append(result.Gateways, &copy)

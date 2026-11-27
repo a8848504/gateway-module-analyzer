@@ -73,6 +73,7 @@ type application struct {
 	cancelDownload                        context.CancelFunc
 	stop                                  chan struct{}
 	rows                                  []gatewayRow
+	rawFrameView                          gatewayRow
 	mu                                    sync.Mutex
 	work                                  []func()
 }
@@ -363,9 +364,14 @@ func windowProc(window uintptr, event uint32, w, l uintptr) uintptr {
 		case wmNotify:
 			// lParam points to a notification structure owned by Windows.
 			header := (*notifyHeader)(*(*unsafe.Pointer)(unsafe.Pointer(&l)))
-			if header != nil && header.source == app.list && header.code == nmCustomDraw {
-				draw := (*listCustomDraw)(unsafe.Pointer(header))
-				return app.drawGatewayList(draw)
+			if header != nil && header.source == app.list {
+				switch header.code {
+				case nmCustomDraw:
+					return app.drawGatewayList((*listCustomDraw)(unsafe.Pointer(header)))
+				case nmClick:
+					app.clickGatewayList((*listClick)(unsafe.Pointer(header)))
+					return 0
+				}
 			}
 		case wmStaticColor:
 			if l == app.updateNotice {
