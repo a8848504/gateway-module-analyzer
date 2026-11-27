@@ -28,16 +28,18 @@ var (
 )
 
 const (
-	startID   = 101
-	stopID    = 102
-	updateID  = 104
-	wmWork    = 0x8001
-	wmCommand = 0x0111
-	wmClose   = 0x0010
-	wmDestroy = 0x0002
-	cbAdd     = 0x0143
-	cbGet     = 0x0147
-	cbSet     = 0x014e
+	startID       = 101
+	stopID        = 102
+	updateID      = 104
+	wmWork        = 0x8001
+	wmCommand     = 0x0111
+	wmNotify      = 0x004e
+	wmStaticColor = 0x0138
+	wmClose       = 0x0010
+	wmDestroy     = 0x0002
+	cbAdd         = 0x0143
+	cbGet         = 0x0147
+	cbSet         = 0x014e
 )
 
 type windowClass struct {
@@ -61,11 +63,13 @@ type message struct {
 type application struct {
 	window, instance, font                uintptr
 	port, duration, mode, list, status    uintptr
+	updateNotice                          uintptr
 	startButton, stopButton, updateButton uintptr
 	scale                                 int
 	busy, closing, stopping               bool
+	checkingUpdate                        bool
 	stop                                  chan struct{}
-	rows                                  [][3]string
+	rows                                  [][4]string
 	mu                                    sync.Mutex
 	work                                  []func()
 }
@@ -128,15 +132,16 @@ func (a *application) makeUI() error {
 	const edit = 0x0080
 	const combo = 0x00210003
 
-	label("网关模组分析    "+version, 20, 16, 505, 24)
+	label("网关模组分析    "+version, 20, 16, 275, 24)
+	a.updateNotice = label("", 310, 16, 245, 24)
 	a.updateButton = a.control("BUTTON", "检查更新", tabstop, 0, updateID, 576, 10, 147, 31)
 	label("TCP 端口", 20, 54, 76, 24)
 	a.port = a.control("EDIT", "7115", tabstop|edit|0x2000, edge, 0, 96, 50, 72, 28)
 	label("采样秒数", 188, 54, 76, 24)
 	a.duration = a.control("EDIT", "60", tabstop|edit|0x2000, edge, 0, 264, 50, 70, 28)
 	a.mode = a.control("COMBOBOX", "", combo, 0, 0, 354, 50, 171, 180)
-	comboAdd(a.mode, "实时采样（Npcap）")
 	comboAdd(a.mode, "结束后统计（Pktmon）")
+	comboAdd(a.mode, "实时采样（Npcap）")
 	comboSet(a.mode, 0)
 	a.startButton = a.control("BUTTON", "开始", tabstop|1, 0, startID, 547, 49, 82, 30)
 	a.stopButton = a.control("BUTTON", "停止", tabstop, 0, stopID, 641, 49, 82, 30)
@@ -160,7 +165,7 @@ func (a *application) setBusy(value bool) {
 	enabled(a.port, !value)
 	enabled(a.duration, !value)
 	enabled(a.mode, !value)
-	enabled(a.updateButton, !value)
+	enabled(a.updateButton, !value && !a.checkingUpdate)
 }
 
 func (a *application) beginCapture() {
@@ -173,7 +178,7 @@ func (a *application) beginCapture() {
 		messageBox(a.window, "输入无效", "请输入 1–65535 的 TCP 端口及 5–1800 秒的采样时间。", 0x30)
 		return
 	}
-	live := comboGet(a.mode) == 0
+	live := comboGet(a.mode) == 1
 	stop := make(chan struct{})
 	a.stop, a.stopping = stop, false
 	a.setBusy(true)
@@ -242,18 +247,39 @@ func sampleStatus(sample *capture.Sample) string {
 	return status
 }
 
-func (a *application) checkUpdate() {
-	if a.busy {
+func (a *application) showUpdateNotice(release *update.Release) {
+	notice := ""
+	if release != nil {
+		notice = "发现新版本 " + release.Version
+	}
+	text(a.updateNotice, notice)
+}
+
+func (a *application) checkUpdate(interactive bool) {
+	if a.checkingUpdate || (interactive && a.busy) {
 		return
 	}
 	github := update.NewGitHub(releaseRepo)
-	a.setBusy(true)
-	text(a.status, "正在从 GitHub 检查更新…")
+	a.checkingUpdate = true
+	if interactive {
+		a.setBusy(true)
+		text(a.status, "正在从 GitHub 检查更新…")
+	} else {
+		enabled(a.updateButton, false)
+	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		release, err := github.Latest(ctx, version, runtime.GOARCH)
 		a.post(func() {
+			a.checkingUpdate = false
+			if err == nil {
+				a.showUpdateNotice(release)
+			}
+			if !interactive {
+				enabled(a.updateButton, !a.busy)
+				return
+			}
 			if err != nil {
 				a.setBusy(false)
 				text(a.status, "更新检查失败")
@@ -311,9 +337,23 @@ func windowProc(window uintptr, event uint32, w, l uintptr) uintptr {
 			case stopID:
 				app.stopCapture()
 			case updateID:
-				app.checkUpdate()
+				app.checkUpdate(true)
 			}
 			return 0
+		case wmNotify:
+			// lParam points to a notification structure owned by Windows.
+			header := (*notifyHeader)(*(*unsafe.Pointer)(unsafe.Pointer(&l)))
+			if header != nil && header.source == app.list && header.code == nmCustomDraw {
+				draw := (*listCustomDraw)(unsafe.Pointer(header))
+				return app.drawGatewayList(draw)
+			}
+		case wmStaticColor:
+			if l == app.updateNotice {
+				gdi32.NewProc("SetTextColor").Call(w, abnormalColor)
+				gdi32.NewProc("SetBkMode").Call(w, 1)                      // TRANSPARENT
+				brush, _, _ := user32.NewProc("GetSysColorBrush").Call(15) // COLOR_BTNFACE
+				return brush
+			}
 		case wmWork:
 			app.mu.Lock()
 			work := app.work
@@ -387,6 +427,7 @@ func gui() error {
 		return err
 	}
 	user32.NewProc("ShowWindow").Call(window, 1)
+	app.checkUpdate(false)
 	var msg message
 	for {
 		result, _, err := user32.NewProc("GetMessageW").Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0)
