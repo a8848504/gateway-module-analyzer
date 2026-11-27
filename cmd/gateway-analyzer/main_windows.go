@@ -72,7 +72,7 @@ type application struct {
 	checkingUpdate                        bool
 	cancelDownload                        context.CancelFunc
 	stop                                  chan struct{}
-	rows                                  [][4]string
+	rows                                  []gatewayRow
 	mu                                    sync.Mutex
 	work                                  []func()
 }

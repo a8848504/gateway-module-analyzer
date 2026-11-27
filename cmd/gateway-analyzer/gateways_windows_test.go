@@ -36,10 +36,10 @@ func TestGatewayListShowsAllGateways(t *testing.T) {
 		}
 	}
 	header, _, _ := send.Call(a.list, 0x101f, 0, 0) // LVM_GETHEADER
-	if count, _, _ := send.Call(header, 0x1200, 0, 0); count != 4 {
-		t.Fatalf("expected four columns, got %d", count)
+	if count, _, _ := send.Call(header, 0x1200, 0, 0); count != 5 {
+		t.Fatalf("expected five columns, got %d", count)
 	}
-	assertRows := func(want ...[4]string) {
+	assertRows := func(want ...gatewayRow) {
 		t.Helper()
 		if count, _, _ := send.Call(a.list, 0x1004, 0, 0); int(count) != len(want) {
 			t.Fatalf("row count = %d, want %d", count, len(want))
@@ -113,17 +113,23 @@ func TestGatewayListShowsAllGateways(t *testing.T) {
 	first := &analyze.Gateway{ID: "G1", MAC: "02:00:00:00:00:01", Address: "192.0.2.1:5000", Modules: [2]uint64{5, 0}}
 	second := &analyze.Gateway{ID: "G2", Modules: [2]uint64{0, 8}}
 	a.showGateways([]*analyze.Gateway{first, second})
-	assertRows([4]string{"02:00:00:00:00:01   192.0.2.1:5000", "5", "0", "异常"}, [4]string{"G2", "0", "8", "异常"})
+	assertRows(gatewayRow{"02:00:00:00:00:01   192.0.2.1:5000", "", "5", "0", "异常"},
+		gatewayRow{"G2", "", "0", "8", "异常"})
 	assertColor(0, abnormalColor)
 	first.Modules = [2]uint64{100, 60}
 	a.showGateways([]*analyze.Gateway{first, second})
-	assertRows([4]string{"02:00:00:00:00:01   192.0.2.1:5000", "100", "60", "正常"}, [4]string{"G2", "0", "8", "异常"})
+	assertRows(gatewayRow{"02:00:00:00:00:01   192.0.2.1:5000", "", "100", "60", "正常"},
+		gatewayRow{"G2", "", "0", "8", "异常"})
 	assertColor(0, normalColor)
 	second.MAC = "02:00:00:00:00:02"
 	second.SIMHex = "0123456789AB"
 	a.showGateways([]*analyze.Gateway{first, second})
-	assertRows([4]string{"02:00:00:00:00:01   192.0.2.1:5000", "100", "60", "正常"},
-		[4]string{"02:00:00:00:00:02   SIM 0123456789AB", "0", "8", "异常"})
+	assertRows(gatewayRow{"02:00:00:00:00:01   192.0.2.1:5000", "", "100", "60", "正常"},
+		gatewayRow{"02:00:00:00:00:02", "0123456789AB", "0", "8", "异常"})
+	second.Address = "192.0.2.2:5000"
+	a.showGateways([]*analyze.Gateway{second})
+	assertRows(gatewayRow{"02:00:00:00:00:02   192.0.2.2:5000", "0123456789AB", "0", "8", "异常"})
+	assertColor(0, abnormalColor)
 	a.showGateways(nil)
 	assertRows()
 }

@@ -15,7 +15,7 @@ const (
 	listInsertColumn = 0x1061
 	listSetItemText  = 0x1074
 
-	conclusionColumn   = 3
+	conclusionColumn   = 4
 	normalConclusion   = "正常"
 	abnormalConclusion = "异常"
 	normalColor        = 0x00346516 // COLORREF for #166534
@@ -28,6 +28,8 @@ const (
 	drawNotifySubitems = 0x20 // Also CDRF_NOTIFYITEMDRAW at control prepaint.
 	drawNewColor       = 0x02 // CDRF_NEWFONT tells the control to use the changed color.
 )
+
+type gatewayRow [conclusionColumn + 1]string
 
 type listColumn struct {
 	mask          uint32
@@ -104,10 +106,11 @@ func (a *application) makeGatewayList() error {
 		name          string
 		width, format int
 	}{
-		{"网关", 315, 0},
-		{"模组 1 数量", 130, 1},
-		{"模组 2 数量", 130, 1},
-		{"结论", 100, 2},
+		{"网关", 260, 0},
+		{"SIM 原始值", 130, 0},
+		{"模组 1 数量", 105, 1},
+		{"模组 2 数量", 105, 1},
+		{"结论", 75, 2},
 	}
 	for index, column := range columns {
 		entry := listColumn{mask: 7, format: int32(column.format), width: int32(a.px(column.width)), text: wide(column.name)}
@@ -126,13 +129,11 @@ func (a *application) showGateways(gateways []*analyze.Gateway) {
 			label = gateway.MAC
 			if gateway.Address != "" {
 				label += "   " + gateway.Address
-			} else if gateway.SIMHex != "" {
-				label += "   SIM " + gateway.SIMHex
 			}
 		}
 		first, second := gateway.Modules[0], gateway.Modules[1]
-		row := [4]string{label, strconv.FormatUint(first, 10), strconv.FormatUint(second, 10), moduleConclusion(first, second)}
-		var previous [4]string
+		row := gatewayRow{label, gateway.SIMHex, strconv.FormatUint(first, 10), strconv.FormatUint(second, 10), moduleConclusion(first, second)}
+		var previous gatewayRow
 		if index == len(a.rows) {
 			item := listItem{mask: 1, item: int32(index), text: wide(row[0])}
 			a.rows = append(a.rows, row)
