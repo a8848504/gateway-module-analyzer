@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -50,7 +52,7 @@ func TestNetshConverterBundle(t *testing.T) {
 
 // The hosted Windows test runner is isolated from production capture sessions.
 func TestNetshCompatibilityOnWindows(t *testing.T) {
-	if os.Getenv("GATEWAY_TEST_NETSH") != "1" {
+	if os.Getenv("GATEWAY_TEST_SYSTEM_CAPTURE") != "1" {
 		t.Skip("requires an isolated Windows machine with administrator access")
 	}
 	directory, err := windows.GetSystemDirectory()
@@ -85,7 +87,11 @@ func TestNetshCompatibilityOnWindows(t *testing.T) {
 		t.Fatal(err)
 	}
 	converted := filepath.Join(work, "capture.pcapng")
-	if err := convertNetsh(converter, recording, converted); err != nil {
+	info, err := os.Stat(recording)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := convertNetsh(converter, recording, converted, info.Size()); err != nil {
 		t.Fatal(err)
 	}
 	file, err := os.Open(converted)
@@ -101,4 +107,66 @@ func TestNetshCompatibilityOnWindows(t *testing.T) {
 		t.Fatal("converted Netsh capture contains no TCP packets for the test connection")
 	}
 	t.Logf("Netsh captured and converted %d TCP packets", report.TCPPackets)
+}
+
+func TestPktmonMultiFileOnWindows(t *testing.T) {
+	if os.Getenv("GATEWAY_TEST_SYSTEM_CAPTURE") != "1" {
+		t.Skip("requires an isolated Windows machine with administrator access")
+	}
+	system, err := windows.GetSystemDirectory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pktmon := filepath.Join(system, "pktmon.exe")
+	help, _ := command(10*time.Second, pktmon, "help")
+	converter := pktmonConverter(help)
+	if converter == "" {
+		t.Skip("Pktmon does not have the modern conversion command")
+	}
+	work := t.TempDir()
+	filter := "Gateway_RolloverTest"
+	if _, err := command(10*time.Second, pktmon, "filter", "add", filter, "-t", "TCP", "-p", "443"); err != nil {
+		t.Fatal(err)
+	}
+	defer command(10*time.Second, pktmon, "filter", "remove", filter)
+	if _, err := command(10*time.Second, pktmon, "start", "--capture", "--comp", "nics", "--type", "flow",
+		"--pkt-size", "0", "--file-size", "1", "--log-mode", "multi-file", "--file-name", filepath.Join(work, "capture.etl")); err != nil {
+		t.Fatal(err)
+	}
+	owned := true
+	defer func() {
+		if owned {
+			command(30*time.Second, pktmon, "stop")
+		}
+	}()
+	client := &http.Client{Timeout: 30 * time.Second}
+	response, err := client.Get("https://github.com/a8848504/gateway-module-analyzer/releases/download/v1.4.0/GatewayModuleAnalyzer-Windows-amd64.exe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, copyErr := io.CopyN(io.Discard, response.Body, 5<<20)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || copyErr != nil {
+		t.Fatalf("test download HTTP %d: %v", response.StatusCode, copyErr)
+	}
+	if _, err := command(30*time.Second, pktmon, "stop"); err != nil {
+		t.Fatal(err)
+	}
+	owned = false
+	traces, err := traceFiles(work)
+	if err != nil || len(traces) < 2 {
+		all, _ := os.ReadDir(work)
+		t.Fatalf("expected multiple supported capture files, got %+v, files %v: %v", traces, all, err)
+	}
+	sample, err := analyzeTraces(work, 443, nil, 0, func(status string) { t.Log(status) }, func(recording, converted string, size int64) error {
+		_, err := command(traceWorkTimeout(size), pktmon, converter, recording, "--out", converted)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sample.Report.TCPPackets == 0 {
+		t.Fatal("no TCP packets were counted across the Pktmon files")
+	}
+	t.Logf("analyzed %d Pktmon files and %d TCP packets", len(traces), sample.Report.TCPPackets)
 }

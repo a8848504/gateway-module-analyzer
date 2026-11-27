@@ -9,7 +9,9 @@ Windows 桌面工具。部署在接收网关数据的定位服务器上，按 TC
 3. 默认选中 **结束后统计（系统抓包）**。系统支持 Pktmon 导出 PCAPNG 时优先使用 Pktmon。缺少该能力的 Windows Server 2019 等系统自动使用 Netsh 和内置的 Microsoft etl2pcapng 转换器。已安装 [Npcap](https://npcap.com/#download) 时也可选 **实时采样（Npcap）**，约每秒刷新一次。
 4. 点击 **开始**。结果列表自动展示检测到的所有网关及两个模组的累计上报条数。可随时按 **停止** 结束采样并保留统计结果。
 
-采样期间，原定位程序继续使用原 TCP 端口。Netsh 兼容模式会临时收集本机 TCP 流量，限制日志大小，并在分析时按指定的本机目标端口筛选。Pktmon 和 Netsh 使用系统级采样会话。程序会检查现有会话，Netsh 停止前也会核对本次采样的文件路径。
+采样期间，原定位程序继续使用原 TCP 端口。Netsh 兼容模式临时收集本机 TCP 流量，顺序写入同一个文件，在分析时按指定的本机目标端口筛选。Pktmon 写满一个文件时续写下一份，分析时按顺序合并 TCP 流。空间不足时提前结束采样并统计已经保存的数据。Pktmon 和 Netsh 使用系统级采样会话，程序会检查现有会话，Netsh 停止前也会核对本次采样的文件路径。
+
+完成后可对照采样时间和目标端口载荷跨度。载荷跨度按首末两个带 TCP 载荷的数据包计时，期间可能有空闲。状态栏会显示已发现的 TCP 缺口、截断和解析问题。
 
 [Microsoft etl2pcapng 来源和许可证](internal/capture/third_party/etl2pcapng/README.md)
 

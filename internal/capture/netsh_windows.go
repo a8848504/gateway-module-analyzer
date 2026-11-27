@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -31,8 +30,8 @@ func startNetsh(netsh, recording string) error {
 	// Netsh filters by protocol. The analyzer filters the destination port and
 	// local addresses when reading the file.
 	_, startErr := command(25*time.Second, netsh, "trace", "start", "capture=yes", "report=disabled",
-		"persistent=no", "correlation=no", "perfmerge=no", "filemode=circular",
-		"maxsize="+strconv.Itoa(fileLimitMiB), "protocol=TCP", "tracefile="+recording)
+		"persistent=no", "correlation=no", "perfmerge=no", "filemode=single",
+		"maxsize=0", "protocol=TCP", "tracefile="+recording)
 	current, statusErr := command(10*time.Second, netsh, "trace", "show", "status")
 	if statusErr == nil && netshOwnsCapture(current, recording) {
 		return nil
@@ -73,8 +72,8 @@ func unpackNetshConverter(work string) (string, error) {
 	return filepath.Join(work, "etl2pcapng.exe"), nil
 }
 
-func convertNetsh(converter, recording, converted string) error {
-	output, err := command(90*time.Second, converter, recording, converted)
+func convertNetsh(converter, recording, converted string, size int64) error {
+	output, err := command(traceWorkTimeout(size), converter, recording, converted)
 	if err != nil {
 		return fmt.Errorf("转换 Netsh 采样文件失败: %w", err)
 	}
@@ -117,20 +116,26 @@ func runNetsh(directory, sessions string, port uint16, duration time.Duration, s
 	if err != nil {
 		return nil, fmt.Errorf("无法准备 Netsh 转换组件: %w", err)
 	}
+	checkStorage := func() error { return checkTraceSpace(work, true) }
+	if err := checkStorage(); err != nil {
+		return nil, err
+	}
 	netsh := filepath.Join(directory, "netsh.exe")
 	status("此系统使用 Netsh 兼容采样…")
 	if err := startNetsh(netsh, recording); err != nil {
 		return nil, err
 	}
-	elapsed := waitSampling(port, duration, stop, status)
+	elapsed, warning := waitSampling(port, duration, stop, status, checkStorage)
 	status("正在停止 Netsh 采样…")
 	if err := stopNetsh(netsh, recording); err != nil {
 		return nil, err
 	}
-	status("正在转换 Netsh 采样文件…")
-	converted := filepath.Join(work, "capture.pcapng")
-	if err := convertNetsh(converter, recording, converted); err != nil {
+	sample, err := analyzeTraces(work, port, local, elapsed, status, func(recording, converted string, size int64) error {
+		return convertNetsh(converter, recording, converted, size)
+	})
+	if err != nil {
 		return nil, err
 	}
-	return analyzeCapture(recording, converted, port, local, elapsed, status)
+	sample.Warning = warning
+	return sample, nil
 }

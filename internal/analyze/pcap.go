@@ -65,7 +65,7 @@ func (s *tcpStream) drain(pendingBytes *int, finish bool) {
 	s.gapSince = time.Time{}
 }
 
-func (s *tcpStream) add(sequence uint32, data []byte, pendingBytes *int) error {
+func (s *tcpStream) add(sequence uint32, data []byte, pendingBytes *int, observedAt time.Time) error {
 	if !s.started {
 		s.next, s.started = sequence, true
 	}
@@ -84,17 +84,18 @@ func (s *tcpStream) add(sequence uint32, data []byte, pendingBytes *int) error {
 	s.pending[sequence] = bytes.Clone(data)
 	*pendingBytes += len(data) - oldSize
 	if s.gapSince.IsZero() {
-		s.gapSince = time.Now()
+		s.gapSince = observedAt
 	}
 	return nil
 }
 
 type Session struct {
-	port         uint16
-	local        map[netip.Addr]bool
-	report       *Report
-	streams      map[connection]*tcpStream
-	pendingBytes int
+	port          uint16
+	local         map[netip.Addr]bool
+	report        *Report
+	streams       map[connection]*tcpStream
+	pendingBytes  int
+	nextGapReview time.Time
 }
 
 func NewSession(port uint16, local map[netip.Addr]bool) *Session {
@@ -103,8 +104,12 @@ func NewSession(port uint16, local map[netip.Addr]bool) *Session {
 
 // ResumeAfterGaps keeps live totals moving when the capture missed bytes.
 func (s *Session) ResumeAfterGaps(age time.Duration) {
+	s.resumeAfterGaps(time.Now(), age)
+}
+
+func (s *Session) resumeAfterGaps(now time.Time, age time.Duration) {
 	for _, stream := range s.streams {
-		if !stream.gapSince.IsZero() && time.Since(stream.gapSince) >= age {
+		if !stream.gapSince.IsZero() && now.Sub(stream.gapSince) >= age {
 			stream.drain(&s.pendingBytes, true)
 		}
 	}
@@ -129,10 +134,20 @@ type packetReader interface {
 // ReadCapture reconstructs the TCP direction towards the positioning server.
 // If local is empty, the destination port alone selects this direction.
 func ReadCapture(ctx context.Context, input io.Reader, port uint16, local map[netip.Addr]bool) (*Report, error) {
+	session := NewSession(port, local)
+	if err := session.ReadCapture(ctx, input); err != nil {
+		return nil, err
+	}
+	return session.Finish(0), nil
+}
+
+// ReadCapture appends one capture file in chronological order without
+// disrupting TCP streams that continue into the next file.
+func (s *Session) ReadCapture(ctx context.Context, input io.Reader) error {
 	buffer := bufio.NewReader(input)
 	magic, err := buffer.Peek(4)
 	if err != nil {
-		return nil, fmt.Errorf("抓包文件为空或不完整: %w", err)
+		return fmt.Errorf("抓包文件为空或不完整: %w", err)
 	}
 	var reader packetReader
 	if bytes.Equal(magic, []byte{0x0a, 0x0d, 0x0d, 0x0a}) {
@@ -143,20 +158,18 @@ func ReadCapture(ctx context.Context, input io.Reader, port uint16, local map[ne
 		reader, err = pcapgo.NewReader(buffer)
 	}
 	if err != nil {
-		return nil, err
+		return err
 	}
-
-	session := NewSession(port, local)
 	for {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return err
 		}
 		data, captureInfo, err := reader.ReadPacketData()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return nil, fmt.Errorf("读取抓包文件失败: %w", err)
+			return fmt.Errorf("读取抓包文件失败: %w", err)
 		}
 		link := reader.LinkType()
 		if len(captureInfo.AncillaryData) != 0 {
@@ -164,15 +177,20 @@ func ReadCapture(ctx context.Context, input io.Reader, port uint16, local map[ne
 				link = value
 			}
 		}
-		if err := session.AddPacket(data, captureInfo, link); err != nil {
-			return nil, err
+		count := s.report.TCPPackets
+		if err := s.AddPacket(data, captureInfo, link); err != nil {
+			return err
+		}
+		if at := captureInfo.Timestamp; s.report.TCPPackets != count && at.After(s.nextGapReview) {
+			s.resumeAfterGaps(at, 10*time.Second)
+			s.nextGapReview = at.Add(time.Second)
 		}
 	}
-	return session.Finish(0), nil
+	return nil
 }
 
 func (s *Session) AddPacket(data []byte, captureInfo gopacket.CaptureInfo, link layers.LinkType) error {
-	packet := gopacket.NewPacket(data, link, gopacket.NoCopy)
+	packet := gopacket.NewPacket(data, link, gopacket.DecodeOptions{NoCopy: true, Lazy: true})
 	network := packet.NetworkLayer()
 	if network == nil {
 		if packet.ErrorLayer() != nil {
@@ -185,7 +203,7 @@ func (s *Session) AddPacket(data []byte, captureInfo gopacket.CaptureInfo, link 
 		s.report.UnsupportedPackets++
 		return nil
 	}
-	if packet.Layer(layers.LayerTypeIPv6Fragment) != nil {
+	if network.LayerType() == layers.LayerTypeIPv6 && packet.Layer(layers.LayerTypeIPv6Fragment) != nil {
 		s.report.UnsupportedPackets++
 		return nil
 	}
@@ -200,6 +218,14 @@ func (s *Session) AddPacket(data []byte, captureInfo gopacket.CaptureInfo, link 
 		return nil
 	}
 	s.report.TCPPackets++
+	if at := captureInfo.Timestamp; len(tcp.Payload) != 0 && !at.IsZero() {
+		if s.report.FirstTCPPayload.IsZero() || at.Before(s.report.FirstTCPPayload) {
+			s.report.FirstTCPPayload = at
+		}
+		if at.After(s.report.LastTCPPayload) {
+			s.report.LastTCPPayload = at
+		}
+	}
 	if captureInfo.CaptureLength < captureInfo.Length || packet.Metadata().Truncated {
 		s.report.CaptureTruncated++
 	}
@@ -231,7 +257,11 @@ func (s *Session) AddPacket(data []byte, captureInfo gopacket.CaptureInfo, link 
 		}
 	}
 	if len(tcp.Payload) != 0 {
-		return stream.add(seq, tcp.Payload, &s.pendingBytes)
+		at := captureInfo.Timestamp
+		if at.IsZero() {
+			at = time.Now()
+		}
+		return stream.add(seq, tcp.Payload, &s.pendingBytes, at)
 	}
 	return nil
 }

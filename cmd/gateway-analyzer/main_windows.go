@@ -154,7 +154,7 @@ func (a *application) makeUI() error {
 	comboSet(a.mode, 0)
 	a.startButton = a.control("BUTTON", "开始", tabstop|1, 0, startID, 547, 49, 82, 30)
 	a.stopButton = a.control("BUTTON", "停止", tabstop, 0, stopID, 641, 49, 82, 30)
-	a.status = label("请选择采样方式，定位服务可继续运行。", 20, 94, 585, 23)
+	a.status = label("请选择采样方式，定位服务可继续运行。", 20, 94, 703, 46)
 	a.progressBar = a.control("msctls_progress32", "", 1, 0, 0, 20, 119, 580, 14)
 	a.cancelUpdateButton = a.control("BUTTON", "取消下载", tabstop, 0, cancelUpdateID, 614, 105, 109, 29)
 	if a.progressBar == 0 || a.cancelUpdateButton == 0 {
@@ -246,18 +246,39 @@ func (a *application) stopCapture() {
 
 func sampleStatus(sample *capture.Sample) string {
 	report := sample.Report
-	status := "采样结束"
+	status := fmt.Sprintf("采样 %.0f 秒 · 目标端口 TCP 包 %d", sample.Duration.Seconds(), report.TCPPackets)
+	if !report.FirstTCPPayload.IsZero() {
+		span := report.LastTCPPayload.Sub(report.FirstTCPPayload)
+		status += fmt.Sprintf(" · 目标端口载荷跨度 %.0f 秒", span.Seconds())
+	}
 	if len(report.Gateways) == 0 {
-		status += "，未识别到网关"
+		status += " · 未识别到网关"
 	}
-	if report.TCPGaps != 0 || report.CaptureDropped != 0 || report.CaptureTruncated != 0 ||
-		report.UnsupportedPackets != 0 || report.BadOuterFrames != 0 || sample.PossibleFileCap || sample.Warning != "" {
-		return status + "，采样可能不完整"
+	var issues []string
+	if sample.Warning != "" {
+		issues = append(issues, sample.Warning)
 	}
-	for _, gateway := range report.Gateways {
-		if gateway.BadInnerFrames != 0 || gateway.UnknownBytes != 0 {
-			return status + "，部分报文未计入"
+	for _, issue := range []struct {
+		label string
+		count uint64
+	}{
+		{"TCP 缺口", report.TCPGaps}, {"抓包丢失", report.CaptureDropped}, {"截断", report.CaptureTruncated},
+		{"外帧校验错误", report.BadOuterFrames}, {"无法解析的网络包", report.UnsupportedPackets},
+	} {
+		if issue.count != 0 {
+			issues = append(issues, fmt.Sprintf("%s %d", issue.label, issue.count))
 		}
+	}
+	var unknownBytes, badInnerFrames uint64
+	for _, gateway := range report.Gateways {
+		unknownBytes += gateway.UnknownBytes
+		badInnerFrames += gateway.BadInnerFrames
+	}
+	if unknownBytes != 0 || badInnerFrames != 0 {
+		issues = append(issues, fmt.Sprintf("未计入内帧 %d，未识别载荷 %d 字节", badInnerFrames, unknownBytes))
+	}
+	if len(issues) != 0 {
+		return status + "\r\n可能不完整 · " + strings.Join(issues, " · ")
 	}
 	return status
 }

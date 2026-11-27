@@ -25,7 +25,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-const fileLimitMiB = 128
+const pktmonSegmentMiB = 128
 
 var activeSession = regexp.MustCompile(`(?im)^\s*pktmon(?:\s|$)`)
 var noFilters = regexp.MustCompile(`(?im)^\s*(?:none[。.]?|no (?:packet )?filters?(?:\s.*)?|无[。.]?|没有(?:任何)?(?:数据包)?(?:筛选器|过滤器)[。.]?|未设置(?:任何)?(?:数据包)?(?:筛选器|过滤器)[。.]?)\s*$`)
@@ -74,10 +74,9 @@ func command(timeout time.Duration, tool string, args ...string) (string, error)
 }
 
 type Sample struct {
-	Report          *analyze.Report
-	Duration        time.Duration
-	PossibleFileCap bool
-	Warning         string
+	Report   *analyze.Report
+	Duration time.Duration
+	Warning  string
 }
 
 func localAddresses() (map[netip.Addr]bool, error) {
@@ -160,6 +159,10 @@ func Run(port uint16, duration time.Duration, stop <-chan struct{}, status func(
 		}
 	}()
 	recording := filepath.Join(work, "capture.etl")
+	checkStorage := func() error { return checkTraceSpace(work, false) }
+	if err := checkStorage(); err != nil {
+		return nil, err
+	}
 	filter := "Gateway_" + hex.EncodeToString(randBytes())
 	if _, err := command(15*time.Second, pktmon, "filter", "add", filter, "-t", "TCP", "-p", strconv.Itoa(int(port))); err != nil {
 		return nil, err
@@ -172,31 +175,33 @@ func Run(port uint16, duration time.Duration, stop <-chan struct{}, status func(
 	status("正在启动旁路采样…")
 	if _, err := command(20*time.Second, pktmon, "start", "--capture", "--comp", "nics",
 		"--type", "flow", "--pkt-size", "0", "--file-name", recording, "--file-size",
-		strconv.Itoa(fileLimitMiB), "--log-mode", "circular"); err != nil {
+		strconv.Itoa(pktmonSegmentMiB), "--log-mode", "multi-file"); err != nil {
 		return nil, fmt.Errorf("启动 Pktmon 失败: %w", err)
 	}
-	elapsed := waitSampling(port, duration, stop, status)
+	elapsed, warning := waitSampling(port, duration, stop, status, checkStorage)
 	status("正在停止采样并整理报文…")
 	if _, err := command(40*time.Second, pktmon, "stop"); err != nil {
 		keepCapture = true
 		return nil, fmt.Errorf("停止 Pktmon 失败，采样文件位于 %s：%w", work, err)
 	}
-	converted := filepath.Join(work, "capture.pcapng")
-	if _, err := command(90*time.Second, pktmon, converter, recording, "--out", converted); err != nil {
-		alternate := "pcapng"
-		if converter == alternate {
-			alternate = "etl2pcap"
+	sample, err := analyzeTraces(work, port, local, elapsed, status, func(recording, converted string, size int64) error {
+		timeout := traceWorkTimeout(size)
+		if _, err := command(timeout, pktmon, converter, recording, "--out", converted); err != nil {
+			alternate := "pcapng"
+			if converter == alternate {
+				alternate = "etl2pcap"
+			}
+			if _, alternateErr := command(timeout, pktmon, alternate, recording, "--out", converted); alternateErr != nil {
+				return errors.Join(err, alternateErr)
+			}
 		}
-		if _, alternateErr := command(90*time.Second, pktmon, alternate, recording, "--out", converted); alternateErr != nil {
-			keepCapture = true
-			return nil, fmt.Errorf("转换采样文件失败，原始数据位于 %s：%w", work, errors.Join(err, alternateErr))
-		}
-	}
-	sample, err := analyzeCapture(recording, converted, port, local, elapsed, status)
+		return nil
+	})
 	if err != nil {
 		keepCapture = true
 		return nil, fmt.Errorf("分析失败，原始数据位于 %s：%w", work, err)
 	}
+	sample.Warning = warning
 	return sample, nil
 }
 
@@ -217,7 +222,7 @@ func modernPktmonOptions(help string) bool {
 		strings.Contains(help, "--log-mode") && strings.Contains(help, "--type")
 }
 
-func waitSampling(port uint16, duration time.Duration, stop <-chan struct{}, status func(string)) time.Duration {
+func waitSampling(port uint16, duration time.Duration, stop <-chan struct{}, status func(string), checkStorage func() error) (time.Duration, string) {
 	start := time.Now()
 	timer := time.NewTimer(duration)
 	defer timer.Stop()
@@ -227,32 +232,15 @@ func waitSampling(port uint16, duration time.Duration, stop <-chan struct{}, sta
 		status(fmt.Sprintf("正在采样 TCP %d · 剩余 %d 秒", port, max(0, int((duration-time.Since(start)).Seconds()+0.99))))
 		select {
 		case <-stop:
-			return time.Since(start)
+			return time.Since(start), ""
 		case <-timer.C:
-			return time.Since(start)
+			return time.Since(start), ""
 		case <-ticks.C:
+			if err := checkStorage(); err != nil {
+				return time.Since(start), "采样提前结束，" + err.Error()
+			}
 		}
 	}
-}
-
-func analyzeCapture(recording, converted string, port uint16, local map[netip.Addr]bool, elapsed time.Duration, status func(string)) (*Sample, error) {
-	capInfo, err := os.Stat(recording)
-	if err != nil {
-		return nil, fmt.Errorf("系统未生成采样文件: %w", err)
-	}
-	file, err := os.Open(converted)
-	if err != nil {
-		return nil, fmt.Errorf("无法打开 PCAPNG 转换结果: %w", err)
-	}
-	defer file.Close()
-	status("正在重组 TCP 和统计人员卡通道…")
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-	report, err := analyze.ReadCapture(ctx, file, port, local)
-	if err != nil {
-		return nil, err
-	}
-	return &Sample{Report: report, Duration: elapsed, PossibleFileCap: capInfo.Size() >= (fileLimitMiB-1)<<20}, nil
 }
 
 func randBytes() []byte {

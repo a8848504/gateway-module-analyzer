@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"sort"
 	"strings"
+	"time"
 )
 
 type Gateway struct {
@@ -34,6 +35,8 @@ type Report struct {
 	PartialOuterFrames uint64     `json:"partial_outer_frames"`
 	UnframedBytes      uint64     `json:"unframed_bytes"`
 	UnsupportedPackets uint64     `json:"unsupported_packets"`
+	FirstTCPPayload    time.Time  `json:"first_tcp_payload,omitzero"`
+	LastTCPPayload     time.Time  `json:"last_tcp_payload,omitzero"`
 	byID               map[string]*Gateway
 }
 

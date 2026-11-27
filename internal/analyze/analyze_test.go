@@ -143,15 +143,66 @@ func TestLiveGapResumesAtNextFrame(t *testing.T) {
 	stream := tcpStream{pending: map[uint32][]byte{}, decoder: decoder{report: report}}
 	var pendingBytes int
 	partial := wrap(rFrame(1), 1)[:7]
-	if err := stream.add(100, partial, &pendingBytes); err != nil {
+	at := time.Now()
+	if err := stream.add(100, partial, &pendingBytes, at); err != nil {
 		t.Fatal(err)
 	}
-	if err := stream.add(120, wrap(rFrame(9), 1), &pendingBytes); err != nil {
+	if err := stream.add(120, wrap(rFrame(9), 1), &pendingBytes, at); err != nil {
 		t.Fatal(err)
 	}
 	stream.drain(&pendingBytes, true)
 	if report.TCPGaps != 1 || report.MissingTCPBytes != 13 || report.PartialOuterFrames != 1 ||
 		report.Gateways[0].Modules != [2]uint64{0, 1} || pendingBytes != 0 {
 		t.Fatalf("recovery crossed a TCP gap: %+v", report)
+	}
+}
+
+func TestLongCaptureKeepsTCPAcrossFiles(t *testing.T) {
+	const port = 5000
+	const source, destination = "192.0.2.2", "192.0.2.1"
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	local := map[netip.Addr]bool{netip.MustParseAddr(destination): true}
+	session := NewSession(port, local)
+	wire := wrap(rFrame(0x12345607), 1)
+	sequence := uint32(1000)
+	for part := range 10 {
+		var log bytes.Buffer
+		writer, err := pcapgo.NewNgWriter(&log, layers.LinkTypeEthernet)
+		if err != nil {
+			t.Fatal(err)
+		}
+		send := func(seq uint32, dest uint16, second int, data []byte) {
+			t.Helper()
+			packet := tcpPacket(t, seq, false, dest, source, destination, data)
+			info := gopacket.CaptureInfo{Timestamp: start.Add(time.Duration(second) * time.Second),
+				CaptureLength: len(packet), Length: len(packet)}
+			if err := writer.WritePacket(info, packet); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if part != 0 {
+			send(sequence+12, port, part*60, wire[12:])
+			sequence += uint32(len(wire))
+		}
+		for second := range 59 {
+			send(sequence, port, part*60+second, wire)
+			sequence += uint32(len(wire))
+		}
+		send(sequence, port, part*60+59, wire[:12])
+		// Packet on another TCP port must not extend the reported time range.
+		send(sequence, port+1, 2000, wire)
+		if err := writer.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		if err := session.ReadCapture(context.Background(), &log); err != nil {
+			t.Fatal(err)
+		}
+	}
+	report := session.Finish(0)
+	if report.Gateways[0].Modules != [2]uint64{599, 0} || report.TCPGaps != 0 || report.PartialOuterFrames != 1 {
+		t.Fatalf("cross-file packets were dropped or miscounted: %+v, %+v", report, report.Gateways)
+	}
+	if span := report.LastTCPPayload.Sub(report.FirstTCPPayload); span != 599*time.Second {
+		t.Fatalf("target payload span = %v", span)
 	}
 }
