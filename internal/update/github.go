@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -22,22 +23,29 @@ var versionPattern = regexp.MustCompile(`^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0
 var repoPattern = regexp.MustCompile(`^[A-Za-z0-9-]+/[A-Za-z0-9_.-]+$`)
 
 type Release struct {
-	Version string
-	Digest  string
-	Size    int64
-	assetID int64
+	Version   string
+	Digest    string
+	Size      int64
+	assetID   int64
+	assetName string
 }
 
 type GitHub struct {
-	repo   string
-	base   string
-	client *http.Client
+	repo         string
+	apiBase      string
+	downloadBase string
+	client       *http.Client
+	idleTimeout  time.Duration
 }
 
 func NewGitHub(repo string) *GitHub {
-	return &GitHub{repo: repo, base: "https://api.github.com",
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = 30 * time.Second
+	return &GitHub{
+		repo: repo, apiBase: "https://api.github.com", downloadBase: "https://github.com",
+		idleTimeout: 60 * time.Second,
 		client: &http.Client{
-			Timeout: 2 * time.Minute,
+			Transport: transport,
 			CheckRedirect: func(request *http.Request, via []*http.Request) error {
 				host := request.URL.Hostname()
 				if len(via) >= 5 || request.URL.Scheme != "https" || request.URL.User != nil ||
@@ -76,11 +84,8 @@ func newer(latest, current [3]int) bool {
 	return false
 }
 
-func (g *GitHub) request(ctx context.Context, endpoint, accept string) (*http.Response, error) {
-	if !repoPattern.MatchString(g.repo) {
-		return nil, errors.New("升级仓库配置无效")
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, g.base+"/repos/"+g.repo+endpoint, nil)
+func (g *GitHub) request(ctx context.Context, address, accept string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, address, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -89,6 +94,10 @@ func (g *GitHub) request(ctx context.Context, endpoint, accept string) (*http.Re
 	req.Header.Set("User-Agent", "GatewayModuleAnalyzer")
 	res, err := g.client.Do(req)
 	if err != nil {
+		var requestErr *url.Error
+		if errors.As(err, &requestErr) {
+			err = requestErr.Err
+		}
 		return nil, fmt.Errorf("访问 GitHub 失败: %w", err)
 	}
 	if res.StatusCode != http.StatusOK {
@@ -102,11 +111,14 @@ func (g *GitHub) request(ctx context.Context, endpoint, accept string) (*http.Re
 }
 
 func (g *GitHub) Latest(ctx context.Context, current, arch string) (*Release, error) {
+	if !repoPattern.MatchString(g.repo) {
+		return nil, errors.New("升级仓库配置无效")
+	}
 	currentVersion, ok := versionParts(current)
 	if !ok {
 		return nil, errors.New("当前构建没有正式版本号")
 	}
-	response, err := g.request(ctx, "/releases/latest", "application/vnd.github+json")
+	response, err := g.request(ctx, g.apiBase+"/repos/"+g.repo+"/releases/latest", "application/vnd.github+json")
 	if err != nil {
 		return nil, err
 	}
@@ -142,37 +154,10 @@ func (g *GitHub) Latest(ctx context.Context, current, arch string) (*Release, er
 		}
 		digest := strings.TrimPrefix(asset.Digest, "sha256:")
 		if validDigest(digest) {
-			return &Release{Version: latest.Version, Digest: strings.ToLower(digest), Size: asset.Size, assetID: asset.ID}, nil
+			return &Release{Version: latest.Version, Digest: strings.ToLower(digest), Size: asset.Size, assetID: asset.ID, assetName: asset.Name}, nil
 		}
 	}
 	return nil, errors.New("发行版缺少对应 Windows 架构的已校验 EXE")
-}
-
-func (g *GitHub) Download(ctx context.Context, release *Release, directory string) (string, error) {
-	response, err := g.request(ctx, "/releases/assets/"+strconv.FormatInt(release.assetID, 10), "application/octet-stream")
-	if err != nil {
-		return "", err
-	}
-	defer response.Body.Close()
-	file, err := os.CreateTemp(directory, ".gateway-update-*.bin")
-	if err != nil {
-		return "", err
-	}
-	path := file.Name()
-	digest := sha256.New()
-	n, err := io.Copy(io.MultiWriter(file, digest), io.LimitReader(response.Body, release.Size+1))
-	closeErr := file.Close()
-	if err == nil {
-		err = closeErr
-	}
-	if err == nil && (n != release.Size || hex.EncodeToString(digest.Sum(nil)) != release.Digest) {
-		err = errors.New("下载文件大小或 SHA-256 校验失败")
-	}
-	if err != nil {
-		os.Remove(path)
-		return "", err
-	}
-	return path, nil
 }
 
 func validDigest(digest string) bool {

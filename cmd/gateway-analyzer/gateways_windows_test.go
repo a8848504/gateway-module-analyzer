@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"runtime"
+	"strings"
 	"testing"
 	"unsafe"
 
@@ -73,6 +75,26 @@ func TestGatewayListShowsAllGateways(t *testing.T) {
 	if got := read(a.updateNotice); got != "" {
 		t.Fatalf("cleared update notice = %q", got)
 	}
+	a.showDownloadControls(true)
+	a.showDownloadProgress(update.DownloadProgress{Received: 2 << 20, Total: 8 << 20, Attempt: 1})
+	if pos, _, _ := send.Call(a.progressBar, 0x0408, 0, 0); pos != 25 { // PBM_GETPOS
+		t.Fatalf("download progress position = %d, want 25", pos)
+	}
+	if label := read(a.status); !strings.Contains(label, "25%") || !strings.Contains(label, "2.00 / 8.00 MiB") {
+		t.Fatalf("download progress label = %q", label)
+	}
+	a.showDownloadProgress(update.DownloadProgress{Total: 8 << 20, Attempt: 2})
+	if label := read(a.status); !strings.Contains(label, "备用下载地址") {
+		t.Fatalf("fallback stage label = %q", label)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a.cancelDownload = cancel
+	a.requestDownloadCancel()
+	if ctx.Err() != context.Canceled {
+		t.Fatal("cancel download did not cancel its request")
+	}
+	a.showDownloadControls(false)
 	assertColor := func(row uintptr, want uint32) {
 		t.Helper()
 		draw := &listCustomDraw{

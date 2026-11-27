@@ -6,7 +6,6 @@ import (
 	"unsafe"
 
 	"gateway-module-analyzer/internal/analyze"
-	"golang.org/x/sys/windows"
 )
 
 const (
@@ -96,13 +95,7 @@ func moduleConclusion(first, second uint64) string {
 }
 
 func (a *application) makeGatewayList() error {
-	common := struct{ size, classes uint32 }{8, 1} // ICC_LISTVIEW_CLASSES
-	comctl := windows.NewLazySystemDLL("comctl32.dll")
-	initialized, _, _ := comctl.NewProc("InitCommonControlsEx").Call(uintptr(unsafe.Pointer(&common)))
-	if initialized == 0 {
-		return errors.New("无法初始化网关列表组件")
-	}
-	a.list = a.control("SysListView32", "", 0x00018005, 0x0200, 0, 20, 126, 703, 307)
+	a.list = a.control("SysListView32", "", 0x00018005, 0x0200, 0, 20, 147, 703, 286)
 	if a.list == 0 {
 		return errors.New("无法创建网关列表")
 	}

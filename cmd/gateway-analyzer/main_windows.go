@@ -2,9 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -28,18 +28,19 @@ var (
 )
 
 const (
-	startID       = 101
-	stopID        = 102
-	updateID      = 104
-	wmWork        = 0x8001
-	wmCommand     = 0x0111
-	wmNotify      = 0x004e
-	wmStaticColor = 0x0138
-	wmClose       = 0x0010
-	wmDestroy     = 0x0002
-	cbAdd         = 0x0143
-	cbGet         = 0x0147
-	cbSet         = 0x014e
+	startID        = 101
+	stopID         = 102
+	updateID       = 104
+	cancelUpdateID = 105
+	wmWork         = 0x8001
+	wmCommand      = 0x0111
+	wmNotify       = 0x004e
+	wmStaticColor  = 0x0138
+	wmClose        = 0x0010
+	wmDestroy      = 0x0002
+	cbAdd          = 0x0143
+	cbGet          = 0x0147
+	cbSet          = 0x014e
 )
 
 type windowClass struct {
@@ -64,10 +65,12 @@ type application struct {
 	window, instance, font                uintptr
 	port, duration, mode, list, status    uintptr
 	updateNotice                          uintptr
+	progressBar, cancelUpdateButton       uintptr
 	startButton, stopButton, updateButton uintptr
 	scale                                 int
 	busy, closing, stopping               bool
 	checkingUpdate                        bool
+	cancelDownload                        context.CancelFunc
 	stop                                  chan struct{}
 	rows                                  [][4]string
 	mu                                    sync.Mutex
@@ -124,6 +127,12 @@ func (a *application) control(class, value string, style, exStyle uintptr, id, x
 }
 
 func (a *application) makeUI() error {
+	common := struct{ size, classes uint32 }{8, 0x21} // List-view and progress controls.
+	comctl := windows.NewLazySystemDLL("comctl32.dll")
+	initialized, _, _ := comctl.NewProc("InitCommonControlsEx").Call(uintptr(unsafe.Pointer(&common)))
+	if initialized == 0 {
+		return errors.New("无法初始化窗口控件")
+	}
 	label := func(value string, x, y, w, h int) uintptr {
 		return a.control("STATIC", value, 0, 0, 0, x, y, w, h)
 	}
@@ -145,7 +154,13 @@ func (a *application) makeUI() error {
 	comboSet(a.mode, 0)
 	a.startButton = a.control("BUTTON", "开始", tabstop|1, 0, startID, 547, 49, 82, 30)
 	a.stopButton = a.control("BUTTON", "停止", tabstop, 0, stopID, 641, 49, 82, 30)
-	a.status = label("请选择采样方式，定位服务可继续运行。", 20, 94, 703, 23)
+	a.status = label("请选择采样方式，定位服务可继续运行。", 20, 94, 585, 23)
+	a.progressBar = a.control("msctls_progress32", "", 1, 0, 0, 20, 119, 580, 14)
+	a.cancelUpdateButton = a.control("BUTTON", "取消下载", tabstop, 0, cancelUpdateID, 614, 105, 109, 29)
+	if a.progressBar == 0 || a.cancelUpdateButton == 0 {
+		return errors.New("无法创建更新进度控件")
+	}
+	a.showDownloadControls(false)
 
 	a.setBusy(false)
 	return a.makeGatewayList()
@@ -283,7 +298,11 @@ func (a *application) checkUpdate(interactive bool) {
 			if err != nil {
 				a.setBusy(false)
 				text(a.status, "更新检查失败")
-				messageBox(a.window, "更新检查失败", err.Error(), 0x30)
+				detail := err.Error()
+				if errors.Is(err, context.DeadlineExceeded) {
+					detail = "连接 GitHub 检查版本超时，请稍后重试。"
+				}
+				messageBox(a.window, "更新检查失败", detail, 0x30)
 				return
 			}
 			if release == nil {
@@ -296,35 +315,9 @@ func (a *application) checkUpdate(interactive bool) {
 				text(a.status, "已取消更新")
 				return
 			}
-			text(a.status, "正在下载并校验更新…")
-			go a.installUpdate(github, release)
+			a.beginUpdateDownload(github, release)
 		})
 	}()
-}
-
-func (a *application) installUpdate(github *update.GitHub, release *update.Release) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	target, err := os.Executable()
-	var candidate string
-	if err == nil {
-		candidate, err = github.Download(ctx, release, filepath.Dir(target))
-	}
-	if err == nil {
-		err = update.StartReplacement(target, candidate, release.Digest)
-	}
-	a.post(func() {
-		if err != nil {
-			if candidate != "" {
-				os.Remove(candidate)
-			}
-			a.setBusy(false)
-			text(a.status, "更新失败")
-			messageBox(a.window, "更新失败", err.Error(), 0x30)
-			return
-		}
-		user32.NewProc("DestroyWindow").Call(a.window)
-	})
 }
 
 func windowProc(window uintptr, event uint32, w, l uintptr) uintptr {
@@ -338,6 +331,8 @@ func windowProc(window uintptr, event uint32, w, l uintptr) uintptr {
 				app.stopCapture()
 			case updateID:
 				app.checkUpdate(true)
+			case cancelUpdateID:
+				app.requestDownloadCancel()
 			}
 			return 0
 		case wmNotify:
@@ -364,6 +359,11 @@ func windowProc(window uintptr, event uint32, w, l uintptr) uintptr {
 			}
 			return 0
 		case wmClose:
+			if app.cancelDownload != nil {
+				app.closing = true
+				app.requestDownloadCancel()
+				return 0
+			}
 			if app.stop != nil {
 				app.closing = true
 				app.stopCapture()
